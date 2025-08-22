@@ -719,13 +719,6 @@ ATT_RULES: Dict[str, Dict] = {
         ],
         "prefer_tags": {"Allegato_C"},
     },
-    "Allegato C – Firma": {
-        "any_of": [
-            _compile_rx(r"firmat[oa]\s+digitalmente"),
-            _compile_rx(r"\b(p7m|firma\s+digitale|firma\s+qualificat[ae])\b"),
-        ],
-        "restrict_to_tags": {"Allegato_C"},
-    },
 
     # -------------------- Allegato C1 -------------------
     "Allegato C1 – Presenza": {
@@ -734,13 +727,6 @@ ATT_RULES: Dict[str, Dict] = {
             _compile_rx(r"(descrizion[ea]\s+progetto|titolo\s+progetto)"),
         ],
         "prefer_tags": {"Allegato_C1"},
-    },
-    "Allegato C1 – Firma": {
-        "any_of": [
-            _compile_rx(r"firmat[oa]\s+digitalmente"),
-            _compile_rx(r"\b(p7m|firma\s+digitale|firma\s+qualificat[ae])\b"),
-        ],
-        "restrict_to_tags": {"Allegato_C1"},
     },
 
     # -------------------- Allegato C2 -------------------
@@ -751,13 +737,6 @@ ATT_RULES: Dict[str, Dict] = {
         ],
         "prefer_tags": {"Allegato_C2"},
     },
-    "Allegato C2 – Firma": {
-        "any_of": [
-            _compile_rx(r"firmat[oa]\s+digitalmente"),
-            _compile_rx(r"\b(p7m|firma\s+digitale|firma\s+qualificat[ae])\b"),
-        ],
-        "restrict_to_tags": {"Allegato_C2"},
-    },
 
     # -------------------- Allegato C3 -------------------
     "Allegato C3 – Presenza": {
@@ -766,13 +745,6 @@ ATT_RULES: Dict[str, Dict] = {
             _compile_rx(r"ripartizion[ea]|articolo\s*21\s*regolamento\s*\(ue\)\s*2022/2472"),
         ],
         "prefer_tags": {"Allegato_C3"},
-    },
-    "Allegato C3 – Firma": {
-        "any_of": [
-            _compile_rx(r"firmat[oa]\s+digitalmente"),
-            _compile_rx(r"\b(p7m|firma\s+digitale|firma\s+qualificat[ae])\b"),
-        ],
-        "restrict_to_tags": {"Allegato_C3"},
     },
 
     # -------------------- Allegato E --------------------
@@ -783,14 +755,6 @@ ATT_RULES: Dict[str, Dict] = {
         ],
         "prefer_tags": {"Allegato_E"},
     },
-    "Allegato E – Firma": {
-        "any_of": [
-            _compile_rx(r"firmat[oa]\s+digitalmente"),
-            _compile_rx(r"\b(p7m|firma\s+digitale|firma\s+qualificat[ae])\b"),
-        ],
-        "restrict_to_tags": {"Allegato_E"},
-    },
-
 }
 
 
@@ -987,12 +951,12 @@ with st.sidebar:
                 selected.append(nome)
 
         # KEY STABILE
-        if st.button("📚 Crea RAG", key="btn_build_rag"):
+        if st.button("📚 Addestra Sistema", key="btn_build_rag"):
             sel_texts = {n: st.session_state.texts[n] for n in selected} if selected else st.session_state.texts
             retriever, _ = build_retriever(sel_texts)
             st.session_state.retriever = retriever
             st.session_state.llm = get_llm()
-            st.success(f"📚 RAG pronta! Documenti indicizzati: {len(sel_texts)}")
+            st.success(f"📚 Addestramento terminato! Documenti indicizzati: {len(sel_texts)}")
 
 
 # Main – Lista file + tag
@@ -1021,27 +985,28 @@ with st.expander("📝 Anteprima testi estratti", expanded=False):
             )
 
 
-# Firmatari digitali
-st.subheader("🔐 Firme digitali rilevate")
-trovati = False
-for nome, firmatari in st.session_state.signers.items():
-    if not firmatari:
-        continue
-    trovati = True
-    with st.expander(f"{nome}"):
-        for i, info in enumerate(firmatari, 1):
-            if "Errore" in info:
-                st.error(f"Errore durante la lettura della firma: {info['Errore']}")
-            else:
-                st.markdown(f"**Firmatario #{i}**")
-                st.write(f"- **CN**: {info['CN']}")
-                st.write(f"- **Emesso da**: {info['Emesso da']}")
-                st.write(f"- **Valido dal**: {info['Valido dal']}")
-                st.write(f"- **Valido fino**: {info['Valido fino']}")
-                st.divider()
+# ---------------------- Firme digitali (mostra solo dopo estrazione) ----------------------
+if st.session_state.texts:  # se ci sono testi estratti, vuol dire che hai già caricato/elaborato i file
+    st.subheader("🔐 Firme digitali rilevate")
+    trovati = False
+    for nome, firmatari in st.session_state.signers.items():
+        if not firmatari:
+            continue
+        trovati = True
+        with st.expander(f"{nome}"):
+            for i, info in enumerate(firmatari, 1):
+                if "Errore" in info:
+                    st.error(f"Errore durante la lettura della firma: {info['Errore']}")
+                else:
+                    st.markdown(f"**Firmatario #{i}**")
+                    st.write(f"- **CN**: {info['CN']}")
+                    st.write(f"- **Emesso da**: {info['Emesso da']}")
+                    st.write(f"- **Valido dal**: {info['Valido dal']}")
+                    st.write(f"- **Valido fino**: {info['Valido fino']}")
+                    st.divider()
 
-if not trovati:
-    st.info("Nessuna firma digitale rilevata nei file caricati (.p7m).")
+    if not trovati:
+        st.info("Nessuna firma digitale rilevata nei file caricati (.p7m).")
 
 
 # ---------------------------- Q&A + Check-list ------------------------------
@@ -1096,33 +1061,55 @@ if st.session_state.retriever and st.session_state.llm:
     if st.session_state.last_free_evidence:
         render_evidence_block(st.session_state.last_free_evidence, section_id="free")
 
-    # ----------------- Checklist Allegati (regex forti, no RAG) -------------
+        # ----------------- Checklist Allegati (regex forti, no RAG) -------------
     st.markdown("---")
-    st.header("📌 Presenza allegati (no RAG, regex forti)")
+    st.header("📌 Presenza allegati (Regex)")
 
-    # Stili per righe/icone
+    # CSS migliorato (compatibile con dark/light mode)
     st.markdown("""
     <style>
-    .chklist {margin:.2rem 0 1rem 0;}
-    .chk-row{
-      display:flex;align-items:center;gap:.6rem;
-      padding:.45rem .65rem;border-radius:.6rem;border:1px solid #ececec;
-      margin:.35rem 0;background:#fafafa;
+    .allegati-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 1rem;
+      margin-top: 1rem;
     }
-    .chk-icon{font-size:1.15rem;width:1.6rem;text-align:center}
-    .chk-label{font-weight:600}
-    .chk-answer{margin-left:auto;opacity:.9; font-size:.92rem}
-    .badge-ok{color:#0f5132;background:#d1e7dd;border:1px solid #badbcc;padding:.15rem .45rem;border-radius:.5rem}
-    .badge-ko{color:#842029;background:#f8d7da;border:1px solid #f5c2c7;padding:.15rem .45rem;border-radius:.5rem}
+    .allegato-card {
+      border-radius: 10px;
+      border: 1px solid #444;
+      padding: 1rem 1.2rem;
+      background-color: rgba(255,255,255,0.02); /* trasparente, adatta a dark/light */
+    }
+    .allegato-title {
+      font-size: 1rem;
+      font-weight: 700;
+      margin-bottom: .4rem;
+    }
+    .badge {
+      display:inline-block;
+      padding: .25rem .6rem;
+      border-radius: .5rem;
+      font-size:.82rem;
+      font-weight:600;
+    }
+    .badge-ok {color:#0f5132; background:#d1e7dd; border:1px solid #badbcc;}
+    .badge-ko {color:#842029; background:#f8d7da; border:1px solid #f5c2c7;}
+    .badge-na {color:#999; background:#e0e0e0; border:1px solid #ccc;}
+    .answer-text {
+      font-size: .85rem;
+      margin-top: .6rem;
+      opacity: 0.9;
+    }
     </style>
     """, unsafe_allow_html=True)
 
     # Stato risultati allegati
     if "att_results" not in st.session_state:
-        st.session_state.att_results = {}  # label -> {"ans": str, "ev": List[Dict]}
+        st.session_state.att_results = {}
     if "att_ran_once" not in st.session_state:
-        st.session_state.att_ran_once = False  # per sapere se abbiamo già calcolato tutto
+        st.session_state.att_ran_once = False
 
+    # Comandi
     colA, colB = st.columns([1, 1])
     with colA:
         if st.button("▶️ Verifica tutti", key="btn_att_check_all"):
@@ -1131,53 +1118,34 @@ if st.session_state.retriever and st.session_state.llm:
                 st.session_state.att_results[label] = {"ans": ans, "ev": ev}
             st.session_state.att_ran_once = True
     with colB:
-        # reset solo se necessario
         if st.button("♻️ Reset risultati", key="btn_att_reset"):
             st.session_state.att_results = {}
             st.session_state.att_ran_once = False
 
-    st.markdown('<div class="chklist">', unsafe_allow_html=True)
-
-    # Render lista (se non abbiamo ancora calcolato, calcola on-demand quando clicchi su una riga)
+    # Griglia card
+    st.markdown('<div class="allegati-grid">', unsafe_allow_html=True)
     for label in ATT_RULES.keys():
         res = st.session_state.att_results.get(label)
 
-        # Calcolo lazy per singola riga
-        run_single = st.button(f"🔎 Verifica «{label}»", key=stable_key("btn_att_single", label))
-        if run_single:
-            ans, ev = check_attachment_rule(label, st.session_state.texts)
-            res = {"ans": ans, "ev": ev}
-            st.session_state.att_results[label] = res
-
-        # Icone e badge
-        icon_html = "❔"
-        badge_html = '<span class="badge-ko">Non verificato</span>'
-        answer_text = ""
-
-        if res:
+        if not res:
+            badge = '<span class="badge badge-na">Non verificato</span>'
+            icon = "❔"
+            answer = "_Premi verifica per controllare_"
+        else:
             ok = str(res["ans"]).lower().startswith("sì")
-            icon_html = "✅" if ok else "❌"
-            badge_html = '<span class="badge-ok">Presente</span>' if ok else '<span class="badge-ko">Assente</span>'
-            answer_text = res["ans"]
+            badge = '<span class="badge badge-ok">Presente</span>' if ok else '<span class="badge badge-ko">Assente</span>'
+            icon = "✅" if ok else "❌"
+            answer = res["ans"]
 
-        # Riga
         st.markdown(
-            f'''
-            <div class="chk-row">
-                <div class="chk-icon">{icon_html}</div>
-                <div class="chk-label">{label}</div>
-                <div class="chk-answer">{badge_html}</div>
+            f"""
+            <div class="allegato-card">
+              <div class="allegato-title">{icon} {label}</div>
+              <div>{badge}</div>
+              <div class="answer-text">{answer}</div>
             </div>
-            ''',
-            unsafe_allow_html=True
+            """, unsafe_allow_html=True
         )
-
-        # Dettaglio + evidenza
-        if res:
-            with st.expander("Dettaglio ed evidenza", expanded=False):
-                st.write(answer_text or "—")
-                render_evidence_block(res.get("ev", []), section_id=f"allegati:{label}")
-
     st.markdown('</div>', unsafe_allow_html=True)
 
     # ----------------- Check-list RAG (tutto il resto) ----------------------
