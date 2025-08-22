@@ -21,7 +21,6 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
-from concurrent.futures import ThreadPoolExecutor
 import string
 import hashlib
 import unicodedata
