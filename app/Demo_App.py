@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Patch per usare SQLite moderno su Streamlit Cloud (evita errore Chroma/FAISS)
+# Patch per usare SQLite moderno su Streamlit Cloud (evita errore Chroma/FAISS)----
 # ─────────────────────────────────────────────────────────────────────────────
 try:
     import importlib
