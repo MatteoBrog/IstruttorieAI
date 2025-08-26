@@ -1220,3 +1220,4 @@ if st.session_state.retriever and st.session_state.llm:
                 )
         st.divider()
 
+# integrazione estrazione automatica dati Allegato B
