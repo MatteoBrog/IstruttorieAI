@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Patch per usare SQLite moderno su Streamlit Cloud (evita errore Chroma/FAISS)----
+# Patch per usare SQLite moderno su Streamlit Cloud (evita errore Chroma/FAISS)
 # ─────────────────────────────────────────────────────────────────────────────
 try:
     import importlib
@@ -25,6 +25,7 @@ import string
 import hashlib
 import unicodedata
 from collections import Counter
+from datetime import datetime
 
 # ----------------------------- Terze parti ---------------------------------
 import fitz  # PyMuPDF
@@ -481,6 +482,256 @@ def _norm_quote_for_compare(s: str) -> str:
     s = s.replace("’", "'").replace("`", "'")
     return _norm_ws(s)
 
+# ---------------------- Allegato B: parser SOLO TESTO ----------------------
+
+def _ab_norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def _ab_clean_value(s: str) -> str:
+    if s is None:
+        return ""
+    s = s.replace("…", " ").replace("·", " ").replace("—", " ").replace("–", " ")
+    s = re.sub(r"[\.]{3,}", " ", s)          # "....." -> " "
+    s = re.sub(r"(\.\s*){3,}", " ", s)       # ". . . . ." -> " "
+    s = s.replace(" :", ":").replace(":", ": ")
+    s = _ab_norm_space(s)
+    s = re.sub(r"\.*$", "", s).strip()
+    return s
+
+# Lookahead per "tagliare" i valori fino alla prossima etichetta nota
+_AB_NEXT_LABELS = [
+    r"Denominazione\s*:", r"Natura giuridica\s*:", r"Posta elettronica certificata",
+    r"Comune di\s*:", r"Prov\.\s*:", r"CAP\b", r"Via e n\. civ\.\s*:", r"Tel\.\s*:", r"Stato\s*:",
+    # RL + varianti
+    r"Cognome\s*:", r"Nome\s*:", r"Data di nascita\s*:",
+    r"Provincia di nascita\s*:", r"Provincia\s*:",            # <— aggiunto
+    r"Comune \(o Stato estero\) di nascita\s*:", r"C\.F\. firmatario\s*:", r"in qualità di",
+    # Referente + varianti telefono
+    r"Società\s*:\s*", r"\bCF\b", r"E-mail\s*:", r"Cellulare\s*:",          # <— aggiunto Cellulare
+    # Progetto / final
+    r"REFERENTE DA CONTATTARE", r"avente\s+per\s+titolo", r"Il\s+costo\s+complessivo",
+    r"Luogo\s+e\s+data", r"FIRMA"
+]
+_AB_NEXT = r"(?=(?:%s))" % "|".join(_AB_NEXT_LABELS)
+# --- Address & phone helpers ---
+_ADDR_FROM_LABEL = re.compile(
+    r"Via\s*(?:e\s*n\.?\s*civ\.?)?\s*:\s*(?P<addr>.+?)(?=\s+(?:Tel\.|Telefono|Stato\b|CAP\b)|$)",
+    re.IGNORECASE
+)
+_ADDR_FALLBACK = re.compile(
+    r"(?:Via|Viale|V\.le|Piazza|P\.zza|P\.le|Corso|C\.so|Largo|Strada|Contrada|C\.da|Localit[aà]|Loc\.)"
+    r"\s+[A-Za-zÀ-ÖØ-öø-ÿ'’\. ]+?(?:\s*(?:n\.?|n°|num\.?|,)?\s*\d+\w?|(?:\s*s\.?n\.?c\.?|\s*snc))",
+    re.IGNORECASE
+)
+_CLEAN_TEL = re.compile(r"\s*(?:Cellulare|Cell\.)\s*:\s*.*$", re.IGNORECASE)
+
+
+def _ab_grab_after(label_regex: str, text: str, max_len: int = 300) -> str:
+    r"""Prende il testo dopo l'etichetta fino alla prossima etichetta."""
+    m = re.search(label_regex + r"(?P<val>.+)", text, flags=re.IGNORECASE)
+    if not m:
+        return ""
+    val = m.group("val")
+    m2 = re.search(_AB_NEXT, val, flags=re.IGNORECASE)
+    if m2:
+        val = val[:m2.start()]
+    return _ab_clean_value(val[:max_len])
+
+def parse_allegato_b_from_text(text_ff: str, source_filename: str = "Allegato_B.pdf") -> dict:
+    """
+    text_ff: testo dell'Allegato B (anche con \f tra pagine va bene).
+    Ritorna un dizionario con tutti i campi estratti.
+    """
+    lines = [_ab_norm_space(l) for l in text_ff.splitlines() if _ab_norm_space(l)]
+    joined = "\n".join(lines)
+    big    = " ".join(lines)
+
+    # Ricava i confini della sezione 1 (SOGGETTO PROPONENTE) per evitare di
+    # pescare CF del firmatario nella sezione 3.
+    m_s2 = re.search(r"\n\s*2\.\s*SEDE\s+LEGALE", joined, flags=re.IGNORECASE)
+    section1 = joined[:m_s2.start()] if m_s2 else joined
+
+    out = {
+        # 1. SOGGETTO PROPONENTE
+        "denominazione": "",
+        "codice_fiscale": "",
+        "partita_iva": "",
+        "natura_giuridica": "",
+        "pec_proponente": "",
+        # 2. SEDE LEGALE
+        "sede_legale_comune": "",
+        "sede_legale_provincia": "",
+        "sede_legale_cap": "",
+        "sede_legale_via_civico": "",
+        "sede_legale_telefono": "",
+        "sede_legale_stato": "",
+        # 3. RAPPRESENTANTE LEGALE
+        "rl_cognome": "",
+        "rl_nome": "",
+        "rl_data_nascita": "",
+        "rl_provincia_nascita": "",
+        "rl_comune_o_stato_estero_nascita": "",
+        "rl_codice_fiscale": "",
+        "rl_in_qualita_di": "",
+        # 4. REFERENTE
+        "ref_cognome": "",
+        "ref_nome": "",
+        "ref_societa": "",
+        "ref_codice_fiscale": "",
+        "ref_telefono": "",
+        "ref_cellulare": "",
+        "ref_email": "",
+        # 5. PROGETTO
+        "progetto_titolo": "",
+        "progetto_durata_mesi": "",
+        "progetto_costo_euro": "",
+        # FINAL
+        "file_origine": source_filename,
+        "estrazione_timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    # ---------- (1) SOGGETTO PROPONENTE ----------
+    out["denominazione"]     = _ab_clean_value(_ab_grab_after(r"Denominazione\s*:\s*", section1))
+    out["natura_giuridica"]  = _ab_clean_value(_ab_grab_after(r"Natura giuridica\s*:\s*", section1))
+    out["pec_proponente"]    = _ab_clean_value(_ab_grab_after(r"Posta elettronica certificata.*?:\s*", section1))
+
+    # CF + P.IVA sulla stessa riga (accetta 'P. IVA' / 'PIVA' / 'Partita IVA')
+    m_cfpi = re.search(
+        r"(?:C\.F\.|Codice\s*fiscale)\s*:\s*(?P<cf>[^P\n\r]+?)\s+"
+        r"(?:P\.?\s*IVA|Partita\s+IVA)\s*[: ]*(?P<piva>[0-9A-Za-z\.\s]+)",
+        section1, flags=re.IGNORECASE)
+    if m_cfpi:
+        out["codice_fiscale"] = _ab_clean_value(m_cfpi.group("cf"))
+        out["partita_iva"]    = _ab_clean_value(m_cfpi.group("piva"))
+    else:
+        # fallback separati nella sola sezione 1
+        out["codice_fiscale"] = _ab_clean_value(_ab_grab_after(r"(?:C\.F\.|Codice\s*fiscale)\s*:\s*", section1))
+        out["partita_iva"]    = _ab_clean_value(_ab_grab_after(r"(?:P\.?\s*IVA|Partita\s+IVA)\s*[: ]*", section1))
+
+    # 2) SEDE LEGALE (campi singoli → niente refusi)
+    out["sede_legale_comune"] = _ab_clean_value(_ab_grab_after(r"Comune di\s*:\s*", joined))
+    out["sede_legale_provincia"] = _ab_clean_value(_ab_grab_after(r"Prov\.\s*:\s*", joined))
+    m_cap = re.search(r"CAP\s*[: ]*\s*(?P<cap>[0-9A-Za-z\.\- ]+)", joined, flags=re.IGNORECASE)
+    out["sede_legale_cap"] = _ab_clean_value(m_cap.group("cap")) if m_cap else _ab_clean_value(
+        _ab_grab_after(r"CAP\s*[: ]*", joined))
+
+    # Isola la sezione 2 per catturare via/telefono in modo robusto
+    m_s2blk = re.search(r"\n\s*2\.\s*SEDE\s+LEGALE.*?(?=\n\s*3\.)", joined, flags=re.IGNORECASE | re.S)
+    sec2 = m_s2blk.group(0) if m_s2blk else joined
+
+    # Via e n. civico (3 tentativi ordinati)
+    addr = _ab_grab_after(r"Via e n\. civ\.\s*:\s*", sec2)
+    if addr:
+        # taglia eventuale "Tel./Telefono/Stato/CAP" sulla stessa riga
+        addr = re.split(r"\s+(?:Tel\.|Telefono|Stato\b|CAP\b)\s*:? ", addr)[0].strip()
+    else:
+        m_label = _ADDR_FROM_LABEL.search(sec2)
+        if m_label:
+            addr = m_label.group("addr").strip()
+        else:
+            m_fb = _ADDR_FALLBACK.search(sec2)
+            addr = m_fb.group(0).strip() if m_fb else ""
+    out["sede_legale_via_civico"] = _ab_clean_value(addr)
+
+    # Telefono (pulizia di eventuale "Cellulare: ...")
+    tel = _ab_grab_after(r"Tel\.\s*:\s*", sec2) or _ab_grab_after(r"Telefono\s*:\s*", sec2)
+    tel = _CLEAN_TEL.sub("", tel).strip()
+    out["sede_legale_telefono"] = _ab_clean_value(tel)
+
+    out["sede_legale_stato"] = _ab_clean_value(_ab_grab_after(r"Stato\s*:\s*", joined))
+
+    # ---------- (3) RAPPRESENTANTE LEGALE ----------
+    out["rl_cognome"] = _ab_clean_value(_ab_grab_after(r"(?m)^\s*Cognome\s*:\s*", joined))
+    out["rl_nome"]    = _ab_clean_value(_ab_grab_after(r"(?m)^\s*Nome\s*:\s*", joined))
+
+    # Riga combinata: "Data di nascita: 15/08/1956 Provincia: CAGLIARI ..."
+    m_dob = re.search(
+        r"Data\s*di\s*nascita\s*:\s*(?P<data>[^\n\r]+?)"
+        r"(?:\s+(?:Prov(?:incia)?(?:\s*di\s*nascita)?|Provincia)\s*:\s*(?P<prov>[^\n\r]+?))?"
+        r"(?:\s+(?:Comune\s*\(o\s*Stato\s*estero\)\s*di\s*nascita|Comune\s*di\s*nascita)\s*:\s*(?P<comune>[^\n\r]+?))?"
+        r"(?=$|\n|\r|Cognome\s*:|Nome\s*:|C\.F\. firmatario\s*:|in qualità di|E-mail\s*:|Tel\.\s*:|Cellulare\s*:)",
+        joined, flags=re.IGNORECASE)
+    if m_dob:
+        out["rl_data_nascita"] = _ab_clean_value(m_dob.group("data"))
+        if not out["rl_provincia_nascita"] and m_dob.group("prov"):
+            out["rl_provincia_nascita"] = _ab_clean_value(m_dob.group("prov"))
+        # NON forziamo 'comune' qui (lo estraiamo anche con la label specifica)
+    else:
+        out["rl_data_nascita"] = _ab_clean_value(_ab_grab_after(r"Data di nascita\s*:\s*", joined))
+
+    # Province (anche se non c'è "di nascita")
+    if not out["rl_provincia_nascita"]:
+        out["rl_provincia_nascita"] = _ab_clean_value(_ab_grab_after(r"Provincia di nascita\s*:\s*", joined))
+    if not out["rl_provincia_nascita"]:
+        out["rl_provincia_nascita"] = _ab_clean_value(_ab_grab_after(r"Provincia\s*:\s*", joined))  # variante breve
+
+    out["rl_comune_o_stato_estero_nascita"] = _ab_clean_value(
+        _ab_grab_after(r"Comune \(o Stato estero\) di nascita\s*:\s*", joined)
+    )
+    out["rl_codice_fiscale"] = _ab_clean_value(_ab_grab_after(r"C\.F\. firmatario\s*:\s*", joined))
+    out["rl_in_qualita_di"]  = _ab_clean_value(_ab_grab_after(r"in qualità di\s*", joined))
+
+    # ---------- (4) REFERENTE ----------
+    if re.search(r"4\.\s*REFERENTE DA CONTATTARE", joined, flags=re.IGNORECASE):
+        ref_section = joined.split("4. REFERENTE DA CONTATTARE", 1)[-1]
+        out["ref_cognome"]   = _ab_clean_value(_ab_grab_after(r"(?m)^\s*Cognome\s*:\s*", ref_section))
+        out["ref_nome"]      = _ab_clean_value(_ab_grab_after(r"(?m)^\s*Nome\s*:\s*", ref_section))
+        out["ref_societa"]   = _ab_clean_value(_ab_grab_after(r"Società\s*:\s*", ref_section))
+        out["ref_codice_fiscale"] = _ab_clean_value(_ab_grab_after(r"\bCF\b\s*[: ]*", ref_section))
+        out["ref_email"]     = _ab_clean_value(_ab_grab_after(r"E-mail\s*:\s*", ref_section))
+        out["ref_telefono"]  = _ab_clean_value(_ab_grab_after(r"Tel\.\s*:\s*", ref_section))
+        out["ref_cellulare"] = _ab_clean_value(_ab_grab_after(r"Cellulare\s*:\s*", ref_section))
+    else:
+        out["ref_societa"]         = _ab_clean_value(_ab_grab_after(r"Società\s*:\s*", joined))
+        out["ref_codice_fiscale"]  = _ab_clean_value(_ab_grab_after(r"\bCF\b\s*[: ]*", joined))
+        out["ref_email"]           = _ab_clean_value(_ab_grab_after(r"E-mail\s*:\s*", joined))
+
+    # ---------- (5) PROGETTO ----------
+    m = re.search(
+        r"avente\s+per\s+titolo\s+(?P<titolo>.+?)\s+della\s+prevista\s+durata\s+di\s+n\s*(?P<mesi>[0-9]+|\w+)\s*mesi",
+        big, flags=re.IGNORECASE)
+    if m:
+        out["progetto_titolo"] = _ab_clean_value(m.group("titolo"))
+        out["progetto_durata_mesi"] = _ab_clean_value(m.group("mesi"))
+    else:
+        out["progetto_titolo"] = _ab_clean_value(_ab_grab_after(r"avente\s+per\s+titolo\s+", big))
+        m3 = re.search(r"durata\s+di\s+n\s*(?P<mesi>[0-9]+|\w+)\s*mesi", big, flags=re.IGNORECASE)
+        if m3:
+            out["progetto_durata_mesi"] = _ab_clean_value(m3.group("mesi"))
+
+    m_cost = re.search(r"Il\s+costo\s+complessivo\s+previsto\s+è\s+di\s+euro\s*(?P<costo>[0-9\.\, ]+)", big, flags=re.IGNORECASE)
+    out["progetto_costo_euro"] = _ab_clean_value(m_cost.group("costo")) if m_cost else _ab_clean_value(_ab_grab_after(r"costo\s+complessivo.*?euro\s*", big))
+
+    # Fallback business rule: impresa individuale ⇒ CF proponente = CF RL (se mancante)
+    if not out["codice_fiscale"] and out.get("rl_codice_fiscale") and "IMPRESA INDIVIDUALE" in out.get("natura_giuridica","").upper():
+        out["codice_fiscale"] = out["rl_codice_fiscale"]
+
+    return out
+
+
+def make_downloads_for_ab(data: dict, base_name: str = "allegato_b"):
+    """Restituisce (json_bytes, csv_bytes, csv_sep)."""
+    json_bytes = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    try:
+        import pandas as pd  # usa pandas se disponibile
+        import io
+        df = pd.DataFrame([data])
+        buf = io.StringIO()
+        df.to_csv(buf, index=False, sep=";")
+        csv_bytes = buf.getvalue().encode("utf-8")
+        sep = ";"
+    except Exception:
+        # csv minimale senza pandas
+        import io
+        keys = list(data.keys())
+        row = ";".join([str(data.get(k, "")).replace(";", ",") for k in keys])
+        buf = io.StringIO()
+        buf.write(";".join(keys) + "\n")
+        buf.write(row + "\n")
+        csv_bytes = buf.getvalue().encode("utf-8")
+        sep = ";"
+    return json_bytes, csv_bytes, sep
+
 
 def _page_text_for(docs: List[Document], src: str, page) -> str:
     for d in docs:
@@ -701,61 +952,65 @@ def _compile_rx(p: str) -> re.Pattern:
     return re.compile(p, re.I | re.S | re.M)
 
 # Le chiavi sono in ordine logico: PRESENZA subito sopra la corrispondente FIRMA
+
 ATT_RULES: Dict[str, Dict] = {
     # -------------------- Allegato B --------------------
     "Allegato B – Presenza": {
-        "all_of": [
-            _compile_rx(r"\ballegato\s*b\b"),
-            _compile_rx(r"domanda\s+di\s+partecipazione"),
+        "any_of": [
+            _compile_rx(r"allegato\s*b\b.{0,600}\bdomanda\s+di\s+partecipazione\b"),
         ],
         "prefer_tags": {"Allegato_B"},
     },
 
     # -------------------- Allegato C --------------------
     "Allegato C – Presenza": {
-        "all_of": [
-            _compile_rx(r"\ballegato\s*c(?!\d)\b"),
-            _compile_rx(r"dichiarazione\s+soggetto\s+proponente|dichiara\s+ai\s+sens[iì]\s+del\s*dpr\s*445/2000"),
+        "any_of": [
+            _compile_rx(
+                r"allegato\s*c(?!\d)\b.{0,600}(?:\bdichiarazione\s+soggetto\s+proponente\b|dpr\s*445/2000|art\.?\s*46)"
+            ),
         ],
         "prefer_tags": {"Allegato_C"},
     },
 
     # -------------------- Allegato C1 -------------------
     "Allegato C1 – Presenza": {
-        "all_of": [
-            _compile_rx(r"\ballegato\s*c1\b"),
-            _compile_rx(r"(descrizion[ea]\s+progetto|titolo\s+progetto)"),
+        "any_of": [
+            _compile_rx(r"allegato\s*c1\b.{0,600}\b(?:descrizion[ea]\s+progetto|titolo\s+progetto)\b"),
         ],
         "prefer_tags": {"Allegato_C1"},
     },
 
     # -------------------- Allegato C2 -------------------
     "Allegato C2 – Presenza": {
-        "all_of": [
-            _compile_rx(r"\ballegato\s*c2\b"),
-            _compile_rx(r"(dettaglio|quadro)\s+finanziari\w*|attivit[aà]\s+finanziabili"),
+        "any_of": [
+            _compile_rx(
+                r"allegato\s*c2\b.{0,600}(?:(?:detag?lio|quadro)\s+finanziari\w*(?:\s+del\s+progetto)?|attivit[aà]\s+finanziabil[ei])"
+            ),
         ],
         "prefer_tags": {"Allegato_C2"},
     },
 
     # -------------------- Allegato C3 -------------------
     "Allegato C3 – Presenza": {
-        "all_of": [
-            _compile_rx(r"\ballegato\s*c3\b"),
-            _compile_rx(r"ripartizion[ea]|articolo\s*21\s*regolamento\s*\(ue\)\s*2022/2472"),
+        "any_of": [
+            _compile_rx(
+                r"allegato\s*c3\b.{0,600}\b(?:ripartizion[ea]\s+territoriale\s+(?:del\s+progetto|degli\s+interventi)|regolamento\s*\(?\s*ue\s*\)?\s*2022/2472)"
+            ),
         ],
         "prefer_tags": {"Allegato_C3"},
     },
 
     # -------------------- Allegato E --------------------
     "Allegato E – Presenza": {
-        "all_of": [
-            _compile_rx(r"\ballegato\s*e\b"),
-            _compile_rx(r"dichiarazione\s+di\s+impegno\s+alla\s+costituzione\s+della\s+filiera\s+biologica"),
+        "any_of": [
+            _compile_rx(
+                r"allegato\s*e\b.{0,600}\bdichiarazione\s+di\s+impegno\s+alla\s+costituzione\s+della\s+filiera\s+biologic[aa]\b"
+            ),
         ],
         "prefer_tags": {"Allegato_E"},
     },
 }
+
 
 
 def _page_of_match(text_ff: str, match_start: int) -> int:
@@ -906,6 +1161,9 @@ if "tag_by_filename" not in st.session_state:
     st.session_state.tag_by_filename: Dict[str, Set[str]] = {}
 if "tag_by_text" not in st.session_state:
     st.session_state.tag_by_text: Dict[str, Set[str]] = {}
+if "ab_extract_result" not in st.session_state:
+    st.session_state.ab_extract_result = None
+
 
 # Sidebar – Upload e pipeline
 with st.sidebar:
@@ -1137,6 +1395,7 @@ if st.session_state.retriever and st.session_state.llm:
             icon = "✅" if ok else "❌"
             answer = res["ans"]
 
+        # Card HTML (uguale per tutti)
         st.markdown(
             f"""
             <div class="allegato-card">
@@ -1144,16 +1403,86 @@ if st.session_state.retriever and st.session_state.llm:
               <div>{badge}</div>
               <div class="answer-text">{answer}</div>
             </div>
-            """, unsafe_allow_html=True
+            """,
+            unsafe_allow_html=True
         )
     st.markdown('</div>', unsafe_allow_html=True)
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Inline controls per Allegato B SE presente (stessa sezione "Presenza allegati")
+    # ─────────────────────────────────────────────────────────────────────────────
+    ab_res = st.session_state.att_results.get("Allegato B – Presenza")
+    ab_ok = bool(ab_res and str(ab_res.get("ans", "")).lower().startswith("sì"))
+
+    if ab_ok:
+        # Trova il/i file candidato/i: 1) evidenza regex, 2) tag Allegato_B, 3) fallback per contenuto
+        ev = (ab_res.get("ev") or [])
+        from_ev = [ev[0]["source"]] if ev else []
+
+        tagged = [f for f, t in st.session_state.doc_tags.items() if "Allegato_B" in t and f not in from_ev]
+
+        rx1 = re.compile(r"\ballegato\s*b\b", re.I)
+        rx2 = re.compile(r"domanda\s+di\s+partecipazione", re.I)
+        by_text = [f for f, txt in st.session_state.texts.items() if rx1.search(txt) and rx2.search(txt)]
+        by_text = [f for f in by_text if f not in from_ev and f not in tagged]
+
+        candidates = from_ev + tagged + by_text
+        candidates = [c for c in candidates if c in st.session_state.texts]  # safety
+
+        st.markdown("#### ➡️ Estrai dati **Allegato B** (inline)")
+        if not candidates:
+            st.info("Nessun documento candidato trovato nonostante il match regex. Controlla i tag o il contenuto.")
+        else:
+            # selezione file (preseleziono quello dell’evidenza)
+            default_idx = 0
+            sel_file = st.selectbox(
+                "Documento riconosciuto come Allegato B:",
+                options=candidates,
+                index=default_idx,
+                key=stable_key("ab_inline_sel", "|".join(candidates))
+            )
+
+            colX, colY = st.columns([0.35, 0.65])
+            with colX:
+                if st.button("▶️ Estrai campi Allegato B", key=stable_key("btn_ab_inline", sel_file)):
+                    txt = st.session_state.texts.get(sel_file, "")
+                    data = parse_allegato_b_from_text(txt, source_filename=sel_file)
+                    st.session_state.ab_extract_result = {"file": sel_file, "data": data}
+
+            # mostra ultimo risultato (persistente tra rerun finché non si resetta)
+            if st.session_state.ab_extract_result:
+                res_file = st.session_state.ab_extract_result["file"]
+                res_data = st.session_state.ab_extract_result["data"]
+
+                st.success(f"Estrazione completata dal documento: **{res_file}**")
+                with st.expander("📄 JSON estratto", expanded=True):
+                    st.json(res_data)
+
+                # download JSON/CSV
+                jb, cb, sep = make_downloads_for_ab(res_data, base_name=os.path.splitext(os.path.basename(res_file))[0])
+                d1, d2 = st.columns(2)
+                with d1:
+                    st.download_button(
+                        "⬇️ Scarica JSON",
+                        data=jb,
+                        file_name=f"{os.path.splitext(os.path.basename(res_file))[0]}_allegato_b.json",
+                        mime="application/json",
+                        use_container_width=True
+                    )
+                with d2:
+                    st.download_button(
+                        f"⬇️ Scarica CSV (sep '{sep}')",
+                        data=cb,
+                        file_name=f"{os.path.splitext(os.path.basename(res_file))[0]}_allegato_b.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
 
     # ----------------- Check-list RAG (tutto il resto) ----------------------
     st.markdown("---")
     st.header("✅ Check-list verifiche (RAG)")
 
     PRESET_QUESTIONS = load_preset_questions()
-
 
     # util per chiavi stabili per-riga
     def stable_id(prefix: str, label: str) -> str:
@@ -1219,5 +1548,3 @@ if st.session_state.retriever and st.session_state.llm:
                     section_id=f"check:{label}"
                 )
         st.divider()
-
-# integrazione estrazione automatica dati Allegato B
