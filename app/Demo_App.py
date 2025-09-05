@@ -5,6 +5,7 @@ try:
     import importlib
     import sys
     import pysqlite3
+
     sys.modules["sqlite3"] = importlib.import_module("pysqlite3")
 except ModuleNotFoundError:
     pass
@@ -91,6 +92,7 @@ def make_key(prefix: str, *parts) -> str:
     st.session_state["__key_counter__"] = c + 1
     return f"{prefix}_{h}_{c}"
 
+
 def stable_key(prefix: str, *parts) -> str:
     """
     Chiave *stabile* per i widget che devono ricordare lo stato (es. bottoni che aprono anteprime).
@@ -112,6 +114,7 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
                 pieces.append("\f")
         return "".join(pieces)
 
+
 def extract_pdf_from_p7m(p7m_bytes: bytes) -> Optional[bytes]:
     """Estrae PDF da busta P7M (PKCS#7)."""
     try:
@@ -119,6 +122,7 @@ def extract_pdf_from_p7m(p7m_bytes: bytes) -> Optional[bytes]:
         return ci["content"]["encap_content_info"]["content"].native
     except Exception:
         return None
+
 
 def _pdf_subbytes(pdf_bytes: bytes, start_page: int, end_page: int) -> bytes:
     """Restituisce un nuovo PDF bytes con pagine [start_page, end_page] (0-based)."""
@@ -130,6 +134,7 @@ def _pdf_subbytes(pdf_bytes: bytes, start_page: int, end_page: int) -> bytes:
     src.close()
     return out
 
+
 @st.cache_resource(show_spinner=False)
 def get_docai_client():
     if not (PROJECT_ID and PROCESSOR_ID and GOOGLE_CREDENTIALS):
@@ -140,47 +145,94 @@ def get_docai_client():
     )
 
 
+# --- helper: iterazione a blocchi di pagine per Document AI (max 15) ---
+def _iter_pdf_chunks(pdf_bytes: bytes, chunk_pages: int = 15):
+    """
+    Spezza il PDF in sotto-PDF da <= chunk_pages e produce tuple:
+    (sub_pdf_bytes, start_page_index_0_based, end_page_index_0_based_incluso)
+    """
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        n = doc.page_count
+        for start in range(0, n, chunk_pages):
+            end = min(n - 1, start + chunk_pages - 1)
+            yield _pdf_subbytes(pdf_bytes, start, end), start, end
+
+
 def run_ocr_with_document_ai(pdf_bytes: bytes) -> str:
+    """
+    Esegue OCR a blocchi (<=15 pagine) e concatena i risultati.
+    Ritorna il testo completo separando i blocchi con \f per preservare i confini pagina.
+    """
     client = get_docai_client()
     if client is None or not PROJECT_ID or not DOC_AI_LOCATION or not PROCESSOR_ID:
-        return ""  # nessun OCR possibile: credenziali/ID mancanti
-
-    name = f"projects/{PROJECT_ID}/locations/{DOC_AI_LOCATION}/processors/{str(PROCESSOR_ID).strip('.')}"
-    try:
-        raw = documentai.RawDocument(content=pdf_bytes, mime_type="application/pdf")
-        resp = client.process_document(request=documentai.ProcessRequest(name=name, raw_document=raw))
-
-        # Limite pagine (opzionale): se vuoi tagliare, fallo solo se pages > MAX
-        MAX_SYNC_PAGES = 15
-        if getattr(resp.document, "pages", None) and len(resp.document.pages) > MAX_SYNC_PAGES:
-            # Preferisci sempre il testo globale; il servizio ha già fatto il merge
-            text = resp.document.text or ""
-        else:
-            text = resp.document.text or ""
-
-        return text.strip()
-    except Exception:
-        # Non bloccare il flusso: torna stringa vuota e lascia che il chiamante gestisca
         return ""
+
+    # N.B. name supporta sia processor che processorVersion; qui rimaniamo su processor
+    name = f"projects/{PROJECT_ID}/locations/{DOC_AI_LOCATION}/processors/{str(PROCESSOR_ID).strip('.')}"
+
+    out_parts: List[str] = []
+    total_pages = 0
+
+    for sub_pdf, start_idx, end_idx in _iter_pdf_chunks(pdf_bytes, chunk_pages=15):
+        # fino a 3 tentativi per chunk
+        last_err = None
+        for attempt in range(3):
+            try:
+                raw = documentai.RawDocument(content=sub_pdf, mime_type="application/pdf")
+                resp = client.process_document(
+                    request=documentai.ProcessRequest(name=name, raw_document=raw)
+                )
+                text = (resp.document.text or "").strip()
+                # Aggiungi un form feed tra blocchi per rispettare i confini
+                if text:
+                    if out_parts:
+                        out_parts.append("\f")
+                    out_parts.append(text)
+                total_pages += (end_idx - start_idx + 1)
+                break  # chunk ok
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    continue
+                # dopo 3 tentativi, salta il chunk ma non bloccare tutto
+                # (opzionale: puoi loggare con st.warning)
+                # st.warning(f"OCR: fallito chunk pagine {start_idx+1}-{end_idx+1}: {e}")
+        # continua con i chunk successivi
+
+    return "".join(out_parts).strip()
 
 
 def _process_blob(blob: bytes) -> str:
+    """
+    Versione chunked identica a run_ocr_with_document_ai (riuso per coerenza).
+    """
     client = get_docai_client()
     if client is None or not PROJECT_ID or not DOC_AI_LOCATION or not PROCESSOR_ID:
         return ""
 
     name = f"projects/{PROJECT_ID}/locations/{DOC_AI_LOCATION}/processors/{str(PROCESSOR_ID).strip('.')}"
-    for attempt in range(3):
-        try:
-            raw = documentai.RawDocument(content=blob, mime_type="application/pdf")
-            resp = client.process_document(request=documentai.ProcessRequest(name=name, raw_document=raw))
-            return (resp.document.text or "").strip()
-        except Exception:
-            if attempt == 2:
-                # dopo 3 tentativi: restituisci vuoto (non sollevare per non interrompere la pipeline)
-                return ""
-            # retry
-            continue
+
+    out_parts: List[str] = []
+    for sub_pdf, start_idx, end_idx in _iter_pdf_chunks(blob, chunk_pages=15):
+        last_err = None
+        for attempt in range(3):
+            try:
+                raw = documentai.RawDocument(content=sub_pdf, mime_type="application/pdf")
+                resp = client.process_document(
+                    request=documentai.ProcessRequest(name=name, raw_document=raw)
+                )
+                text = (resp.document.text or "").strip()
+                if text:
+                    if out_parts:
+                        out_parts.append("\f")
+                    out_parts.append(text)
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    continue
+                # st.warning(f"OCR: fallito chunk pagine {start_idx+1}-{end_idx+1}: {e}")
+    return "".join(out_parts).strip()
 
 
 def estrai_firmatari(p7m_bytes: bytes) -> List[dict]:
@@ -206,6 +258,7 @@ _READABILITY_PROMPT = (
     "Rispondi SOLO con: leggibile / illeggibile.\n\nTESTO:\n"
 )
 
+
 def _normalize(ans: str) -> str:
     cleaned = ans.strip().lower()
     if cleaned == "leggibile":
@@ -214,15 +267,17 @@ def _normalize(ans: str) -> str:
         return "illeggibile"
     return "errore"
 
+
 def _quick_legible(sample: str) -> bool:
     if len(sample) < 60:
         return False
     letters = sum(c.isalpha() for c in sample)
-    spaces  = sample.count(" ")
-    punct   = sum(c in string.punctuation for c in sample)
+    spaces = sample.count(" ")
+    punct = sum(c in string.punctuation for c in sample)
     ratio_letters = letters / max(1, len(sample))
-    ratio_spaces  = spaces  / max(1, len(sample))
-    return (ratio_letters > 0.55 and ratio_spaces > 0.10 and punct < len(sample)*0.15)
+    ratio_spaces = spaces / max(1, len(sample))
+    return (ratio_letters > 0.55 and ratio_spaces > 0.10 and punct < len(sample) * 0.15)
+
 
 def is_readable(sample: str) -> bool:
     if not sample.strip():
@@ -246,9 +301,15 @@ FILENAME_TAGS = {
     "Allegato_C1": [re.compile(r"allegato[_\s-]*c1(\b|\.|_)", re.I)],
     "Allegato_C2": [re.compile(r"allegato[_\s-]*c2(\b|\.|_)", re.I)],
     "Allegato_C3": [re.compile(r"allegato[_\s-]*c3(\b|\.|_)", re.I)],
+    "Allegato_D": [
+        re.compile(r"allegato[_\s-]*d(\b|\.|_)", re.I),
+        re.compile(r"dichiarazion[ei]\s+soggetto\s+beneficiario", re.I),
+    ],
     "Allegato_E": [re.compile(r"allegato[_\s-]*e(\b|\.|_)", re.I),
                    re.compile(r"allegato[_\s-]*eformat", re.I)],
+
 }
+
 
 def classify_by_filename(filename: str) -> Set[str]:
     tags: Set[str] = set()
@@ -258,8 +319,10 @@ def classify_by_filename(filename: str) -> Set[str]:
             tags.add(tag)
     return tags
 
+
 def _rx(p: str) -> re.Pattern:
     return re.compile(p, re.I | re.S | re.M)
+
 
 # Indizi dal CONTENUTO (assegnati come boost)
 CONTENT_TAG_HINTS: Dict[str, List[re.Pattern]] = {
@@ -287,18 +350,368 @@ CONTENT_TAG_HINTS: Dict[str, List[re.Pattern]] = {
         _rx(r"\ballegato\s*c3\b"),
         _rx(r"ripartizion[ea]|articolo\s+21\s+regolamento\s*\(ue\)\s*2022/2472"),
     ],
+    "Allegato_D": [
+        _rx(r"\ballegato\s*d\b"),
+        _rx(r"dichiarazion[ei]\s+soggetto\s+beneficiario"),
+        _rx(r"art\.?\s*46\s+del\s+dpr\s*445/2000"),  # ricorre nella dichiarazione
+    ],
     "Allegato_E": [
         _rx(r"allegatoeformat"),
         _rx(r"dichiarazione\s+di\s+impegno\s+alla\s+costituzione\s+della\s+filiera\s+biologica"),
     ],
 }
 
+
 def classify_by_content(text: str) -> Set[str]:
     tags: Set[str] = set()
-    for tag, patterns in CONTENT_TAG_HINTS.items():
-        if any(rx.search(text) for rx in patterns):
-            tags.add(tag)
+
+    # ---- PEC (mantieni robusto): serve "pec" + una ricevuta (accettazione/consegna)
+    has_pec = bool(_rx(r"\bpec\b|posta elettronica certificat").search(text))
+    has_receipt = bool(_rx(r"ricevut[ae]\s+di\s+accettazione|avvenuta\s+consegna|ricevuta di consegna").search(text))
+    if has_pec and has_receipt:
+        tags.add("PEC")
+
+    # ---- Allegati: usa le regex "forti" riusate dalla checklist, ma SOLO intestazione
+    tags |= detect_attachment_tags(text)
+
     return tags
+
+
+# =========================
+# ANALISI RICEVIBILITÀ PEC
+# =========================
+
+EXPECTED_SUBJECT = (
+    "Istanza per la concessione di agevolazioni volte a favorire le forme di produzione agricola a "
+    "ridotto impatto ambientale e per la promozione di Filiere e distretti di agricoltura biologica - Filiere biologiche"
+)
+
+# Finestra temporale di ricevibilità (inclusiva)
+WINDOW_START = datetime(2024, 6, 12, 12, 0, 0)
+WINDOW_END = datetime(2024, 6, 26, 12, 0, 0)
+
+_RX_PEC = re.compile(r"\bpec\b|posta\s+elettronica\s+certificat", re.I)
+_RX_RECEIPT = re.compile(r"ricevut[ae]\s+di\s+accettazione|avvenuta\s+consegna|ricevuta\s+di\s+consegna", re.I)
+_RX_SUBJECT = re.compile(r"(?:^|\n)\s*(?:oggetto|subject)\s*[:\-]\s*(.+)", re.I)
+_RX_PROTO = re.compile(r"(?:protocollo|prot\.)\s*[:\-]?\s*([A-Z0-9\/\.\-]{4,})", re.I)
+_RX_SENDER_LINE = re.compile(
+    r"(?:^|\n)\s*(?:mittente|from|da|inviato da)\s*[:\-]\s*(.+)", re.I
+)
+_RX_EMAIL = re.compile(
+    r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I
+)
+
+# Date e ore più comuni nelle ricevute PEC italiane
+_DATE_PATTERNS = [
+    r"(\d{2}/\d{2}/\d{4})\s+(?:alle\s+ore\s+)?(\d{2}[:\.]\d{2}(?::\d{2})?)",
+    r"(?:inviat[ao] il|spedita il|consegnat[ao] il)\s+(\d{2}/\d{2}/\d{4})\s+(?:alle\s+ore\s+)?(\d{2}[:\.]\d{2}(?::\d{2})?)",
+    r"(?:del)\s+(\d{2}/\d{2}/\d{4})\s+(?:alle\s+ore\s+)?(\d{2}[:\.]\d{2}(?::\d{2})?)",
+]
+_RX_DATES = [re.compile(p, re.I) for p in _DATE_PATTERNS]
+
+
+def _norm_time(t: str) -> str:
+    # Converte "12.00" -> "12:00"
+    return t.replace(".", ":")
+
+
+def _parse_dt(date_s: str, time_s: str) -> Optional[datetime]:
+    try:
+        time_s = _norm_time(time_s)
+        fmts = ["%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"]
+        for f in fmts:
+            try:
+                return datetime.strptime(f"{date_s} {time_s}", f)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _first_dt_in_text(text: str) -> Optional[datetime]:
+    for rx in _RX_DATES:
+        m = rx.search(text)
+        if m:
+            dt = _parse_dt(m.group(1), m.group(2))
+            if dt:
+                return dt
+    return None
+
+
+def _find_on_page(text_ff: str, rx: re.Pattern) -> Tuple[Optional[str], Optional[int]]:
+    m = rx.search(text_ff)
+    if not m:
+        return None, None
+    quote = re.sub(r"\s+", " ", (m.group(0) if m.lastindex is None else m.group(m.lastindex))).strip()[:240]
+    page = _page_of_match(text_ff, m.start())
+    return quote, page
+
+
+def _find_sender(text_ff: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """
+    Ritorna (sender_display, quote, page).
+    - Prima prova con riga 'Mittente/From/Da/Inviato da: ...'
+    - Poi fallback: prima email trovata vicino a parole chiave PEC.
+    """
+    # 2.1 — preferisci la prima occorrenza con etichetta
+    m = _RX_SENDER_LINE.search(text_ff)
+    if m:
+        raw = m.group(1).strip()
+        email_m = _RX_EMAIL.search(raw)
+        sender_display = raw
+        if email_m and len(raw) > len(email_m.group(0)) + 2:
+            # es: "Ragione Sociale <mail@pec.it>"
+            sender_display = raw
+        elif email_m:
+            sender_display = email_m.group(0)
+        quote = re.sub(r"\s+", " ", (m.group(0))).strip()[:240]
+        page = _page_of_match(text_ff, m.start())
+        return sender_display, quote, page
+
+    # 2.2 — fallback: cerca email “vicino” a indicatori PEC
+    ctx_rx = re.compile(
+        r"(messaggio\s+di\s+posta\s+certificata|postacert|daticert\.xml|ricevut[ae]\s+di\s+accettazione|avvenuta\s+consegna)",
+        re.I
+    )
+    ctx = ctx_rx.search(text_ff)
+    if ctx:
+        start = max(0, ctx.start() - 400)
+        end = min(len(text_ff), ctx.end() + 400)
+        window = text_ff[start:end]
+        em = _RX_EMAIL.search(window)
+        if em:
+            email = em.group(0)
+            quote = re.sub(r"\s+", " ", window[max(0, em.start() - 40):em.end() + 40]).strip()[:240]
+            page = _page_of_match(text_ff, start + em.start())
+            return email, quote, page
+
+    # 2.3 — ultimo tentativo: prima email nel documento
+    em = _RX_EMAIL.search(text_ff)
+    if em:
+        email = em.group(0)
+        quote = email
+        page = _page_of_match(text_ff, em.start())
+        return email, quote, page
+
+    return None, None, None
+
+
+def analyze_pec_document(text_ff: str) -> Dict:
+    """
+    Analizza il testo di UN documento come PEC e risponde alle 4 verifiche:
+    1) Arrivata via PEC (art. 8 c.2)  -> presenza indicatori ricezione/accettazione
+    2) Oggetto conforme               -> confronta con EXPECTED_SUBJECT (togli 'POSTA CERTIFICATA:')
+    3) Nei termini temporali          -> data/ora compresa tra WINDOW_START e WINDOW_END
+    4) Assunta a protocollo           -> presenza di n. protocollo (+ data protocollo)
+    Ritorna un dict con chiavi e struttura: { "esito","dettaglio","evidenza":[{"quote","page"}] }
+    """
+    txt = text_ff or ""
+
+    # --------------------- 1) PEC pervenuta ---------------------
+    rx_receipts = [
+        re.compile(r"messaggio\s+di\s+posta\s+certificata", re.I),
+        re.compile(r"daticert\.xml", re.I),
+        re.compile(r"ricevut[ae]\s+di\s+accettazione|avvenuta\s+consegna|ricevuta\s+di\s+consegna", re.I),
+    ]
+    m_receipt = None
+    for rx in rx_receipts:
+        m_receipt = rx.search(txt)
+        if m_receipt:
+            break
+    is_pec = m_receipt is not None
+    ev1_q = (re.sub(r"\s+", " ", m_receipt.group(0)).strip()[:240] if m_receipt else None)
+    ev1_p = _page_of_match(text_ff, m_receipt.start()) if m_receipt else None
+
+    def pack(ok: bool, detail: str, quote: Optional[str], page: Optional[int]) -> Dict:
+        return {
+            "esito": "Sì" if ok else "No",
+            "dettaglio": detail,
+            "evidenza": [] if not quote else [{"quote": quote, "page": page}],
+        }
+
+    # --------------------- 2) Oggetto conforme ------------------
+    def _norm_subject(s: str) -> str:
+        s = re.sub(r"^\s*posta\s+certificata\s*:\s*", "", s, flags=re.I)
+        s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+        return re.sub(r"\s+", " ", s).strip().lower()
+
+    m_subj = re.search(r"(?:^|\n)\s*(?:oggetto|subject)\s*:\s*(.+)", txt, flags=re.I)
+    subj_raw = m_subj.group(1).strip() if m_subj else ""
+    subj_norm = _norm_subject(subj_raw) if subj_raw else ""
+    exp_norm = _norm_subject(EXPECTED_SUBJECT)
+    ok_subject = bool(subj_norm) and (exp_norm in subj_norm or subj_norm in exp_norm)
+    subj_clean = re.sub(r"^\s*posta\s+certificata\s*:\s*", "", subj_raw, flags=re.I).strip()
+    ev2_q = subj_raw[:240] if subj_raw else None
+    ev2_p = _page_of_match(text_ff, m_subj.start()) if m_subj else None
+
+    # --------------------- 3) Termini (finestra temporale) ------
+    dt = _first_dt_in_text(txt)
+    ok_window = bool(dt and (WINDOW_START <= dt <= WINDOW_END))
+    ev3_q = None
+    ev3_p = None
+    if dt:
+        for rx in _RX_DATES:
+            mm = rx.search(txt)
+            if mm:
+                ev3_q = re.sub(r"\s+", " ", mm.group(0))[:240]
+                ev3_p = _page_of_match(text_ff, mm.start())
+                break
+
+    # --------------------- 3.bis) Mittente PEC -----------------
+    sender, evs_q, evs_p = _find_sender(txt)
+    ok_sender = bool(sender)
+
+    # --------------------- 4) Protocollo (numero + data) -------
+    # Normalizza SOLO per parsing protocollo: togli spazi attorno a "/" e tra cifre
+    txt_compact = re.sub(r"\s*/\s*", "/", txt)
+    txt_compact = re.sub(r"(?<=\d)\s+(?=\d)", "", txt_compact)
+
+    # Esempi coperti:
+    # "Protocollo di ingresso N. 0267858 del 14/06/2024"
+    # "Prot. n 1234/AB in data 01.07.2024"
+    rx_proto_full = re.compile(
+        r"(?:protocollo|prot\.?)\s*(?:di\s*ingresso|ingresso)?\s*(?:n\.?|num\.?)\s*"
+        r"(?P<num>[A-Z0-9\/\.\-]{3,})"
+        r"(?:\s*(?:del|in\s*data)\s*(?P<data>[0-3]?\d[\/\.-][01]?\d[\/\.-]\d{4}))?",
+        re.I | re.S
+    )
+    m_full = rx_proto_full.search(txt_compact)
+    proto_num = (m_full.group("num").strip() if m_full and m_full.group("num") else "")
+    proto_date = (m_full.group("data").strip() if m_full and m_full.group("data") else "")
+    ok_proto = bool(proto_num)
+
+    # Evidenza (quote) dal testo originale, per mostrare riga leggibile
+    rx_proto_line = re.compile(
+        r"(?:protocollo|prot\.?).{0,80}(?:ingresso)?.{0,80}(?:n\.?|num\.?).{0,80}"
+        r"(?:del|in\s*data)?.{0,20}\d{1,2}\s*[\/\.-]\s*\d{1,2}\s*[\/\.-]\s*\d{4}",
+        re.I | re.S
+    )
+    mp_line = rx_proto_line.search(txt)
+    if not mp_line:
+        rx_proto_any = re.compile(r"(?:protocollo|prot\.?).{0,80}(?:n\.?|num\.?).{0,40}[A-Z0-9\/\.\-]{3,}", re.I | re.S)
+        mp_line = rx_proto_any.search(txt)
+
+    ev4_q = (re.sub(r"\s+", " ", mp_line.group(0)).strip()[:240]) if mp_line else (proto_num or None)
+    ev4_p = _page_of_match(text_ff, mp_line.start()) if mp_line else None
+
+    if ok_proto and proto_date:
+        proto_detail = f"Protocollo: {proto_num} — Data: {proto_date}"
+    elif ok_proto:
+        proto_detail = f"Protocollo: {proto_num}"
+    else:
+        proto_detail = "Numero di protocollo non trovato."
+
+    # --------------------- Ritorno risultati --------------------
+    return {
+        "pec_ai_sensi_art8": pack(
+            is_pec,
+            "Ricevuta/indicatori PEC rilevati." if is_pec else "Mancano riferimenti PEC/receipts.",
+            ev1_q, ev1_p
+        ),
+        "oggetto_conforme": pack(
+            ok_subject,
+            (subj_raw if subj_raw else "Oggetto non trovato."),
+            ev2_q, ev2_p
+        ),
+        "nei_termini": pack(
+            ok_window,
+            f"Data rilevata: {dt.strftime('%d/%m/%Y %H:%M:%S')}" if dt else "Data non trovata.",
+            ev3_q, ev3_p
+        ),
+        "mittente_pec": pack(
+            ok_sender,
+            f"Mittente: {sender}" if sender else "Mittente non trovato.",
+            evs_q, evs_p
+        ),
+        "protocollo": pack(
+            ok_proto,
+            proto_detail,
+            ev4_q, ev4_p
+        ),
+        # campi raw comodi per export/uso downstream
+        "protocollo_numero": proto_num,
+        "protocollo_data": proto_date,
+        "oggetto_valore": subj_clean,
+        "mittente_valore": re.sub(r"^\s*Per conto di:\s*", "", sender or "", flags=re.I),
+        "nei_termini_data": dt.strftime("%d/%m/%Y %H:%M:%S") if dt else "",
+    }
+
+    def _norm_subject(s: str) -> str:
+        s = re.sub(r"^\s*posta\s+certificata\s*:\s*", "", s, flags=re.I)
+        s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+        return re.sub(r"\s+", " ", s).strip().lower()
+
+    # prendi riga dopo "Oggetto:" anche se spezzata
+    m_subj = re.search(r"(?:^|\n)\s*(?:oggetto|subject)\s*:\s*(.+)", txt, flags=re.I)
+    subj_raw = m_subj.group(1).strip() if m_subj else ""
+    subj_norm = _norm_subject(subj_raw) if subj_raw else ""
+    exp_norm = _norm_subject(EXPECTED_SUBJECT)
+    ok_subject = bool(subj_norm) and (exp_norm in subj_norm or subj_norm in exp_norm)
+    ev2_q = subj_raw[:240] if subj_raw else None
+    ev2_p = _page_of_match(text_ff, m_subj.start()) if m_subj else None
+
+    # --------------------- 3) Termini ---------------------------
+    dt = _first_dt_in_text(txt)
+    ok_window = bool(dt and (WINDOW_START <= dt <= WINDOW_END))
+    ev3_q = None
+    ev3_p = None
+    if dt:
+        # mostriamo lo stesso match usato per trovare la data
+        for rx in _RX_DATES:
+            mm = rx.search(txt)
+            if mm:
+                ev3_q = re.sub(r"\s+", " ", mm.group(0))[:240]
+                ev3_p = _page_of_match(text_ff, mm.start())
+                break
+
+    # --------------------- 3.bis) Mittente PEC ---------------------------
+    sender, evs_q, evs_p = _find_sender(txt)
+    ok_sender = bool(sender)
+
+    # ... (sezione 4: Protocollo) ...
+
+    # --------------------- 4) Protocollo ------------------------
+    # Normalizza SOLO per il parsing del protocollo: rimuove spazi tra cifre e attorno agli slash
+    txt_compact = re.sub(r"\s*/\s*", "/", txt)
+    txt_compact = re.sub(r"(?<=\d)\s+(?=\d)", "", txt_compact)
+
+    # Regex principale: Protocollo [di] Ingresso N. <numero> (opzionale "del <data>")
+    rx_proto_full = re.compile(
+        r"(?:protocollo|prot\.?)\s*(?:di\s*ingresso|ingresso)?\s*(?:n\.?|num\.?)\s*"
+        r"(?P<num>[A-Z0-9\/\.\-]{3,})"
+        r"(?:\s*(?:del|in\s*data)\s*(?P<data>[0-3]?\d[\/\.-][01]?\d[\/\.-]\d{4}))?",
+        re.I | re.S
+    )
+
+    m_full = rx_proto_full.search(txt_compact)
+    proto_num = (m_full.group("num").strip() if m_full and m_full.group("num") else "")
+    proto_date = (m_full.group("data").strip() if m_full and m_full.group("data") else "")
+
+    ok_proto = bool(proto_num)
+
+    # Evidenza: prova a trovare nel testo originale una riga con Prot... e (se possibile) la data
+    rx_proto_line = re.compile(
+        r"(?:protocollo|prot\.?).{0,80}(?:ingresso)?.{0,80}(?:n\.?|num\.?).{0,80}"
+        r"(?:del|in\s*data)?.{0,20}\d{1,2}\s*[\/\.-]\s*\d{1,2}\s*[\/\.-]\s*\d{4}",
+        re.I | re.S
+    )
+    mp_line = rx_proto_line.search(txt)
+    if not mp_line:
+        # fallback: almeno la parte con "Prot ... N."
+        rx_proto_any = re.compile(r"(?:protocollo|prot\.?).{0,80}(?:n\.?|num\.?).{0,40}[A-Z0-9\/\.\-]{3,}", re.I | re.S)
+        mp_line = rx_proto_any.search(txt)
+
+    ev4_q = (re.sub(r"\s+", " ", mp_line.group(0)).strip()[:240]) if mp_line else (proto_num or None)
+    ev4_p = _page_of_match(text_ff, mp_line.start()) if mp_line else None
+
+    proto_detail = ""
+    if ok_proto and proto_date:
+        proto_detail = f"Protocollo: {proto_num} — Data: {proto_date}"
+    elif ok_proto:
+        proto_detail = f"Protocollo: {proto_num}"
+    else:
+        proto_detail = "Numero di protocollo non trovato."
 
 
 # --------------------- RAG: embeddings, retriever, ask ---------------------
@@ -312,6 +725,7 @@ def get_embeddings() -> Embeddings:
         client_options=ClientOptions(api_endpoint="europe-west4-aiplatform.googleapis.com"),
     )
 
+
 @st.cache_resource(show_spinner=False)
 def get_llm():
     return ChatVertexAI(
@@ -323,6 +737,7 @@ def get_llm():
         max_output_tokens=2048,
     )
 
+
 @st.cache_resource(show_spinner=False)
 def get_text_splitter():
     return RecursiveCharacterTextSplitter(
@@ -331,9 +746,11 @@ def get_text_splitter():
         separators=["\n\n", "\n", ".", " "],
     )
 
+
 class LinesParser(BaseOutputParser):
     def parse(self, text: str) -> List[str]:
         return [line.strip() for line in text.split("\n") if line.strip()]
+
 
 def docs_from_pdf_texts(text_by_file: Dict[str, str]) -> List[Document]:
     """Un Document per pagina, con metadata 'source', 'page' e 'preview'."""
@@ -345,6 +762,7 @@ def docs_from_pdf_texts(text_by_file: Dict[str, str]) -> List[Document]:
                 doc = Document(page_content=p_text, metadata={"source": filename, "page": p_idx})
                 docs.append(doc)
     return docs
+
 
 def build_retriever(text_by_file: Dict[str, str]):
     splitter = get_text_splitter()
@@ -399,36 +817,41 @@ def build_retriever(text_by_file: Dict[str, str]):
     )
     return mqr, chunks
 
+
 def _embed_docs(texts: List[str]) -> np.ndarray:
     embs = get_embeddings().embed_documents(texts)
     return np.array(embs, dtype="float32")
 
+
 def _embed_query(q: str) -> np.ndarray:
     return np.array(get_embeddings().embed_query(q), dtype="float32")
 
+
 IT_STOP = {
-    "la","il","lo","le","i","gli","un","una","di","a","da","in","con","su","per","tra","fra",
-    "che","come","del","della","dello","dei","degli","delle","al","allo","alla","ai","agli","alle",
-    "e","ed","o","oppure","non","sono","sia","sul","sulla","sulle","sugli","nel","nella","nelle","negli",
-    "ai sensi","art","articolo","dpr","ue","avviso","oggetto","mittente","destinatario"
+    "la", "il", "lo", "le", "i", "gli", "un", "una", "di", "a", "da", "in", "con", "su", "per", "tra", "fra",
+    "che", "come", "del", "della", "dello", "dei", "degli", "delle", "al", "allo", "alla", "ai", "agli", "alle",
+    "e", "ed", "o", "oppure", "non", "sono", "sia", "sul", "sulla", "sulle", "sugli", "nel", "nella", "nelle", "negli",
+    "ai sensi", "art", "articolo", "dpr", "ue", "avviso", "oggetto", "mittente", "destinatario"
 }
 
+
 def extract_keywords(q: str) -> List[str]:
-    qn = unicodedata.normalize("NFKD", q).encode("ascii","ignore").decode()
+    qn = unicodedata.normalize("NFKD", q).encode("ascii", "ignore").decode()
     tokens = re.findall(r"[A-Za-z0-9@._-]{3,}", qn.lower())
     toks = [t for t in tokens if t not in IT_STOP and len(t) > 2]
     cnt = Counter(toks)
-    return [t for t,_ in cnt.most_common(6)]
+    return [t for t, _ in cnt.most_common(6)]
+
 
 def rerank_by_cosine_with_boost(
-    query: str,
-    docs: List[Document],
-    liked_tags: Optional[Set[str]] = None,
-    tags_by_source: Optional[Dict[str, Set[str]] ] = None,
-    top_n: int = 14,
-    alpha: float = 0.84,
-    beta: float = 0.10,
-    gamma: float = 0.06,
+        query: str,
+        docs: List[Document],
+        liked_tags: Optional[Set[str]] = None,
+        tags_by_source: Optional[Dict[str, Set[str]]] = None,
+        top_n: int = 14,
+        alpha: float = 0.84,
+        beta: float = 0.10,
+        gamma: float = 0.06,
 ) -> List[Document]:
     """
     Reranking soft:
@@ -471,32 +894,39 @@ def rerank_by_cosine_with_boost(
     order = np.argsort(-scores)
     return [docs[i] for i in order[:min(top_n, len(docs))]]
 
+
 def _strip_header_from_quote(quote: str, src: str) -> str:
     pattern = rf'^\s*\[?\s*{re.escape(src)}\s*–\s*p\.\s*\d+\s*\]?\s*'
     return re.sub(pattern, "", quote or "", flags=re.IGNORECASE).strip()
+
+
 def _norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
+
 
 def _norm_quote_for_compare(s: str) -> str:
     # normalizza spazi e apostrofi semplici/tipografici
     s = s.replace("’", "'").replace("`", "'")
     return _norm_ws(s)
 
+
 # ---------------------- Allegato B: parser SOLO TESTO ----------------------
 
 def _ab_norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
+
 def _ab_clean_value(s: str) -> str:
     if s is None:
         return ""
     s = s.replace("…", " ").replace("·", " ").replace("—", " ").replace("–", " ")
-    s = re.sub(r"[\.]{3,}", " ", s)          # "....." -> " "
-    s = re.sub(r"(\.\s*){3,}", " ", s)       # ". . . . ." -> " "
+    s = re.sub(r"[\.]{3,}", " ", s)  # "....." -> " "
+    s = re.sub(r"(\.\s*){3,}", " ", s)  # ". . . . ." -> " "
     s = s.replace(" :", ":").replace(":", ": ")
     s = _ab_norm_space(s)
     s = re.sub(r"\.*$", "", s).strip()
     return s
+
 
 # Lookahead per "tagliare" i valori fino alla prossima etichetta nota
 _AB_NEXT_LABELS = [
@@ -504,10 +934,10 @@ _AB_NEXT_LABELS = [
     r"Comune di\s*:", r"Prov\.\s*:", r"CAP\b", r"Via e n\. civ\.\s*:", r"Tel\.\s*:", r"Stato\s*:",
     # RL + varianti
     r"Cognome\s*:", r"Nome\s*:", r"Data di nascita\s*:",
-    r"Provincia di nascita\s*:", r"Provincia\s*:",            # <— aggiunto
+    r"Provincia di nascita\s*:", r"Provincia\s*:",  # <— aggiunto
     r"Comune \(o Stato estero\) di nascita\s*:", r"C\.F\. firmatario\s*:", r"in qualità di",
     # Referente + varianti telefono
-    r"Società\s*:\s*", r"\bCF\b", r"E-mail\s*:", r"Cellulare\s*:",          # <— aggiunto Cellulare
+    r"Società\s*:\s*", r"\bCF\b", r"E-mail\s*:", r"Cellulare\s*:",  # <— aggiunto Cellulare
     # Progetto / final
     r"REFERENTE DA CONTATTARE", r"avente\s+per\s+titolo", r"Il\s+costo\s+complessivo",
     r"Luogo\s+e\s+data", r"FIRMA"
@@ -537,6 +967,7 @@ def _ab_grab_after(label_regex: str, text: str, max_len: int = 300) -> str:
         val = val[:m2.start()]
     return _ab_clean_value(val[:max_len])
 
+
 def parse_allegato_b_from_text(text_ff: str, source_filename: str = "Allegato_B.pdf") -> dict:
     """
     text_ff: testo dell'Allegato B (anche con \f tra pagine va bene).
@@ -544,7 +975,7 @@ def parse_allegato_b_from_text(text_ff: str, source_filename: str = "Allegato_B.
     """
     lines = [_ab_norm_space(l) for l in text_ff.splitlines() if _ab_norm_space(l)]
     joined = "\n".join(lines)
-    big    = " ".join(lines)
+    big = " ".join(lines)
 
     # Ricava i confini della sezione 1 (SOGGETTO PROPONENTE) per evitare di
     # pescare CF del firmatario nella sezione 3.
@@ -591,9 +1022,9 @@ def parse_allegato_b_from_text(text_ff: str, source_filename: str = "Allegato_B.
     }
 
     # ---------- (1) SOGGETTO PROPONENTE ----------
-    out["denominazione"]     = _ab_clean_value(_ab_grab_after(r"Denominazione\s*:\s*", section1))
-    out["natura_giuridica"]  = _ab_clean_value(_ab_grab_after(r"Natura giuridica\s*:\s*", section1))
-    out["pec_proponente"]    = _ab_clean_value(_ab_grab_after(r"Posta elettronica certificata.*?:\s*", section1))
+    out["denominazione"] = _ab_clean_value(_ab_grab_after(r"Denominazione\s*:\s*", section1))
+    out["natura_giuridica"] = _ab_clean_value(_ab_grab_after(r"Natura giuridica\s*:\s*", section1))
+    out["pec_proponente"] = _ab_clean_value(_ab_grab_after(r"Posta elettronica certificata.*?:\s*", section1))
 
     # CF + P.IVA sulla stessa riga (accetta 'P. IVA' / 'PIVA' / 'Partita IVA')
     m_cfpi = re.search(
@@ -602,11 +1033,11 @@ def parse_allegato_b_from_text(text_ff: str, source_filename: str = "Allegato_B.
         section1, flags=re.IGNORECASE)
     if m_cfpi:
         out["codice_fiscale"] = _ab_clean_value(m_cfpi.group("cf"))
-        out["partita_iva"]    = _ab_clean_value(m_cfpi.group("piva"))
+        out["partita_iva"] = _ab_clean_value(m_cfpi.group("piva"))
     else:
         # fallback separati nella sola sezione 1
         out["codice_fiscale"] = _ab_clean_value(_ab_grab_after(r"(?:C\.F\.|Codice\s*fiscale)\s*:\s*", section1))
-        out["partita_iva"]    = _ab_clean_value(_ab_grab_after(r"(?:P\.?\s*IVA|Partita\s+IVA)\s*[: ]*", section1))
+        out["partita_iva"] = _ab_clean_value(_ab_grab_after(r"(?:P\.?\s*IVA|Partita\s+IVA)\s*[: ]*", section1))
 
     # 2) SEDE LEGALE (campi singoli → niente refusi)
     out["sede_legale_comune"] = _ab_clean_value(_ab_grab_after(r"Comune di\s*:\s*", joined))
@@ -642,7 +1073,7 @@ def parse_allegato_b_from_text(text_ff: str, source_filename: str = "Allegato_B.
 
     # ---------- (3) RAPPRESENTANTE LEGALE ----------
     out["rl_cognome"] = _ab_clean_value(_ab_grab_after(r"(?m)^\s*Cognome\s*:\s*", joined))
-    out["rl_nome"]    = _ab_clean_value(_ab_grab_after(r"(?m)^\s*Nome\s*:\s*", joined))
+    out["rl_nome"] = _ab_clean_value(_ab_grab_after(r"(?m)^\s*Nome\s*:\s*", joined))
 
     # Riga combinata: "Data di nascita: 15/08/1956 Provincia: CAGLIARI ..."
     m_dob = re.search(
@@ -669,22 +1100,22 @@ def parse_allegato_b_from_text(text_ff: str, source_filename: str = "Allegato_B.
         _ab_grab_after(r"Comune \(o Stato estero\) di nascita\s*:\s*", joined)
     )
     out["rl_codice_fiscale"] = _ab_clean_value(_ab_grab_after(r"C\.F\. firmatario\s*:\s*", joined))
-    out["rl_in_qualita_di"]  = _ab_clean_value(_ab_grab_after(r"in qualità di\s*", joined))
+    out["rl_in_qualita_di"] = _ab_clean_value(_ab_grab_after(r"in qualità di\s*", joined))
 
     # ---------- (4) REFERENTE ----------
     if re.search(r"4\.\s*REFERENTE DA CONTATTARE", joined, flags=re.IGNORECASE):
         ref_section = joined.split("4. REFERENTE DA CONTATTARE", 1)[-1]
-        out["ref_cognome"]   = _ab_clean_value(_ab_grab_after(r"(?m)^\s*Cognome\s*:\s*", ref_section))
-        out["ref_nome"]      = _ab_clean_value(_ab_grab_after(r"(?m)^\s*Nome\s*:\s*", ref_section))
-        out["ref_societa"]   = _ab_clean_value(_ab_grab_after(r"Società\s*:\s*", ref_section))
+        out["ref_cognome"] = _ab_clean_value(_ab_grab_after(r"(?m)^\s*Cognome\s*:\s*", ref_section))
+        out["ref_nome"] = _ab_clean_value(_ab_grab_after(r"(?m)^\s*Nome\s*:\s*", ref_section))
+        out["ref_societa"] = _ab_clean_value(_ab_grab_after(r"Società\s*:\s*", ref_section))
         out["ref_codice_fiscale"] = _ab_clean_value(_ab_grab_after(r"\bCF\b\s*[: ]*", ref_section))
-        out["ref_email"]     = _ab_clean_value(_ab_grab_after(r"E-mail\s*:\s*", ref_section))
-        out["ref_telefono"]  = _ab_clean_value(_ab_grab_after(r"Tel\.\s*:\s*", ref_section))
+        out["ref_email"] = _ab_clean_value(_ab_grab_after(r"E-mail\s*:\s*", ref_section))
+        out["ref_telefono"] = _ab_clean_value(_ab_grab_after(r"Tel\.\s*:\s*", ref_section))
         out["ref_cellulare"] = _ab_clean_value(_ab_grab_after(r"Cellulare\s*:\s*", ref_section))
     else:
-        out["ref_societa"]         = _ab_clean_value(_ab_grab_after(r"Società\s*:\s*", joined))
-        out["ref_codice_fiscale"]  = _ab_clean_value(_ab_grab_after(r"\bCF\b\s*[: ]*", joined))
-        out["ref_email"]           = _ab_clean_value(_ab_grab_after(r"E-mail\s*:\s*", joined))
+        out["ref_societa"] = _ab_clean_value(_ab_grab_after(r"Società\s*:\s*", joined))
+        out["ref_codice_fiscale"] = _ab_clean_value(_ab_grab_after(r"\bCF\b\s*[: ]*", joined))
+        out["ref_email"] = _ab_clean_value(_ab_grab_after(r"E-mail\s*:\s*", joined))
 
     # ---------- (5) PROGETTO ----------
     m = re.search(
@@ -699,11 +1130,14 @@ def parse_allegato_b_from_text(text_ff: str, source_filename: str = "Allegato_B.
         if m3:
             out["progetto_durata_mesi"] = _ab_clean_value(m3.group("mesi"))
 
-    m_cost = re.search(r"Il\s+costo\s+complessivo\s+previsto\s+è\s+di\s+euro\s*(?P<costo>[0-9\.\, ]+)", big, flags=re.IGNORECASE)
-    out["progetto_costo_euro"] = _ab_clean_value(m_cost.group("costo")) if m_cost else _ab_clean_value(_ab_grab_after(r"costo\s+complessivo.*?euro\s*", big))
+    m_cost = re.search(r"Il\s+costo\s+complessivo\s+previsto\s+è\s+di\s+euro\s*(?P<costo>[0-9\.\, ]+)", big,
+                       flags=re.IGNORECASE)
+    out["progetto_costo_euro"] = _ab_clean_value(m_cost.group("costo")) if m_cost else _ab_clean_value(
+        _ab_grab_after(r"costo\s+complessivo.*?euro\s*", big))
 
     # Fallback business rule: impresa individuale ⇒ CF proponente = CF RL (se mancante)
-    if not out["codice_fiscale"] and out.get("rl_codice_fiscale") and "IMPRESA INDIVIDUALE" in out.get("natura_giuridica","").upper():
+    if not out["codice_fiscale"] and out.get("rl_codice_fiscale") and "IMPRESA INDIVIDUALE" in out.get(
+            "natura_giuridica", "").upper():
         out["codice_fiscale"] = out["rl_codice_fiscale"]
 
     return out
@@ -718,7 +1152,7 @@ def make_downloads_for_ab(data: dict, base_name: str = "allegato_b"):
         df = pd.DataFrame([data])
         buf = io.StringIO()
         df.to_csv(buf, index=False, sep=";")
-        csv_bytes = buf.getvalue().encode("utf-8")
+        csv_bytes = buf.getvalue().encode("utf-8-sig")
         sep = ";"
     except Exception:
         # csv minimale senza pandas
@@ -728,7 +1162,7 @@ def make_downloads_for_ab(data: dict, base_name: str = "allegato_b"):
         buf = io.StringIO()
         buf.write(";".join(keys) + "\n")
         buf.write(row + "\n")
-        csv_bytes = buf.getvalue().encode("utf-8")
+        csv_bytes = buf.getvalue().encode("utf-8-sig")
         sep = ";"
     return json_bytes, csv_bytes, sep
 
@@ -738,6 +1172,7 @@ def _page_text_for(docs: List[Document], src: str, page) -> str:
         if d.metadata.get("source") == src and str(d.metadata.get("page")) == str(page):
             return d.page_content
     return ""
+
 
 def _auto_extract_evidence(question: str, docs: List[Document]) -> Optional[Dict]:
     """Se la LLM non produce una quote valida, prova a trovarne una vicino alle keyword della query."""
@@ -750,17 +1185,18 @@ def _auto_extract_evidence(question: str, docs: List[Document]) -> Optional[Dict
         m = kw_re.search(txt)
         if m:
             start = max(0, m.start() - 160)
-            end   = min(len(txt), m.end() + 160)
+            end = min(len(txt), m.end() + 160)
             quote = re.sub(r"\s+", " ", txt[start:end]).strip()[:240]
             if quote:
-                return {"source": d.metadata.get("source","?"), "page": d.metadata.get("page","?"), "quote": quote}
+                return {"source": d.metadata.get("source", "?"), "page": d.metadata.get("page", "?"), "quote": quote}
     return None
 
+
 def ask_rag(
-    question: str,
-    retriever,
-    llm,
-    liked_tags: Optional[Set[str]] = None,
+        question: str,
+        retriever,
+        llm,
+        liked_tags: Optional[Set[str]] = None,
 ) -> Tuple[str, List[Dict]]:
     """
     Ritorna (final_answer, evidence_list).
@@ -778,7 +1214,7 @@ def ask_rag(
     context_blocks = []
     for d in docs:
         src = d.metadata.get("source", "?")
-        pg  = d.metadata.get("page", "?")
+        pg = d.metadata.get("page", "?")
         txt = d.page_content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         context_blocks.append(f'<doc source="{src}" page="{pg}">\n{txt}\n</doc>')
     context = "\n".join(context_blocks)
@@ -841,12 +1277,12 @@ def ask_rag(
     for ev in ev_list[:1]:
         try:
             src = str(ev.get("source", "?")).strip()
-            pg  = ev.get("page", "?")
+            pg = ev.get("page", "?")
             try:
                 pg = int(pg)
             except Exception:
                 pg = str(pg)
-            q   = _strip_header_from_quote(str(ev.get("quote", ""))[:240], src)
+            q = _strip_header_from_quote(str(ev.get("quote", ""))[:240], src)
             page_txt = _page_text_for(docs, src, pg)
             if q and page_txt:
                 qt = _norm_quote_for_compare(q)
@@ -906,6 +1342,29 @@ def process_uploaded_file(file) -> Optional[str]:
     st.session_state.tag_by_filename[name] = tags_fn
     st.session_state.tag_by_text[name] = tags_tx
 
+    # --- Precedenza nome file e singolarità Allegato_* ---
+    allegati_fn = {t for t in tags_fn if t.startswith("Allegato_")}
+    allegati_tx = {t for t in tags_tx if t.startswith("Allegato_")}
+
+    primary = None
+    if allegati_fn:
+        for t in ALLEGATO_TAG_ORDER:
+            if t in allegati_fn:
+                primary = t
+                break
+    elif allegati_tx:
+        for t in ALLEGATO_TAG_ORDER:
+            if t in allegati_tx:
+                primary = t
+                break
+
+    # Se c'è un Allegato_* primario, rimuovi gli altri per evitare rumore
+    if primary:
+        for t in list(allegati_fn | allegati_tx):
+            if t != primary:
+                tags_fn.discard(t)
+                tags_tx.discard(t)
+
     all_tags = tags_fn.union(tags_tx)
 
     st.session_state.texts[name] = text
@@ -936,6 +1395,7 @@ def show_pdf_page_image(src_name: str, page: int, zoom: float = 1.6):
     except Exception as e:
         st.error(f"Errore anteprima pagina: {e}")
 
+
 def render_evidence_block(evidence: List[Dict], section_id: str, title: str = "📎 Evidenza"):
     if not evidence:
         return
@@ -950,6 +1410,7 @@ def render_evidence_block(evidence: List[Dict], section_id: str, title: str = "�
 # ---------------------- Allegati (regex forti, no RAG) ---------------------
 def _compile_rx(p: str) -> re.Pattern:
     return re.compile(p, re.I | re.S | re.M)
+
 
 # Le chiavi sono in ordine logico: PRESENZA subito sopra la corrispondente FIRMA
 
@@ -1000,6 +1461,14 @@ ATT_RULES: Dict[str, Dict] = {
         "prefer_tags": {"Allegato_C3"},
     },
 
+    "Allegato D – Presenza": {
+        "any_of": [
+            _compile_rx(r"allegato\s*d\b.{0,400}\bdichiarazion[ei]\s+soggetto\s+beneficiario\b"),
+            _compile_rx(r"\bdichiarazion[ei]\s+soggetto\s+beneficiario\b.{0,400}art\.?\s*46\s+dpr\s*445/2000"),
+        ],
+        "prefer_tags": {"Allegato_D"},
+    },
+
     # -------------------- Allegato E --------------------
     "Allegato E – Presenza": {
         "any_of": [
@@ -1011,6 +1480,43 @@ ATT_RULES: Dict[str, Dict] = {
     },
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tagging robusto Allegati: riuso regex "forti" (le stesse di ATT_RULES).
+# Considera SOLO l'intestazione (prima pagina) per evitare match su semplici citazioni.
+# ─────────────────────────────────────────────────────────────────────────────
+ALLEGATO_TAG_ORDER = ["Allegato_B", "Allegato_C", "Allegato_C1", "Allegato_C2", "Allegato_C3", "Allegato_D",
+                      "Allegato_E"]
+
+# Mappa tag -> patterns "any_of" riusando ATT_RULES (coerenza con la checklist)
+TAG_ANY_OF = {
+    "Allegato_B": ATT_RULES["Allegato B – Presenza"]["any_of"],
+    "Allegato_C": ATT_RULES["Allegato C – Presenza"]["any_of"],
+    "Allegato_C1": ATT_RULES["Allegato C1 – Presenza"]["any_of"],
+    "Allegato_C2": ATT_RULES["Allegato C2 – Presenza"]["any_of"],
+    "Allegato_C3": ATT_RULES["Allegato C3 – Presenza"]["any_of"],
+    "Allegato_D": ATT_RULES["Allegato D – Presenza"]["any_of"],
+    "Allegato_E": ATT_RULES["Allegato E – Presenza"]["any_of"],
+}
+
+
+def _head(text_ff: str, max_chars: int = 6000) -> str:
+    """Ritorna la prima pagina (o i primi max_chars) per evitare match su semplici citazioni."""
+    first_page = text_ff.split("\f", 1)[0]
+    return first_page[:max_chars]
+
+
+def detect_attachment_tags(text_ff: str) -> Set[str]:
+    """Applica le regex 'forti' alla sola intestazione per decidere il tag Allegato_*."""
+    head = _head(text_ff)
+    out: Set[str] = set()
+    for tag, patterns in TAG_ANY_OF.items():
+        if _match_any_of(head, patterns):
+            out.add(tag)
+    # se matchano più tag, scegli un primario coerente
+    for t in ALLEGATO_TAG_ORDER:
+        if t in out:
+            return {t}
+    return out
 
 
 def _page_of_match(text_ff: str, match_start: int) -> int:
@@ -1024,6 +1530,7 @@ def _page_of_match(text_ff: str, match_start: int) -> int:
         off = nxt + 1
     return max(1, len(pages))
 
+
 def _find_one(text: str, rx: re.Pattern) -> Optional[Tuple[str, int]]:
     m = rx.search(text)
     if not m:
@@ -1031,6 +1538,7 @@ def _find_one(text: str, rx: re.Pattern) -> Optional[Tuple[str, int]]:
     quote = re.sub(r"\s+", " ", m.group(0)).strip()[:240]
     page = _page_of_match(text, m.start())
     return (quote, page)
+
 
 def _match_all_of(text: str, patterns: List[re.Pattern]) -> Optional[List[Tuple[str, int]]]:
     out: List[Tuple[str, int]] = []
@@ -1041,12 +1549,14 @@ def _match_all_of(text: str, patterns: List[re.Pattern]) -> Optional[List[Tuple[
         out.append(found)
     return out
 
+
 def _match_any_of(text: str, patterns: List[re.Pattern]) -> Optional[Tuple[str, int]]:
     for rx in patterns:
         found = _find_one(text, rx)
         if found:
             return found
     return None
+
 
 def check_attachment_rule(rule_label: str, texts_by_file: Dict[str, str]) -> Tuple[str, List[Dict]]:
     """
@@ -1075,7 +1585,7 @@ def check_attachment_rule(rule_label: str, texts_by_file: Dict[str, str]) -> Tup
     # ordinamento: prima i file con i tag preferiti
     if prefer_tags:
         preferred = [f for f in files if st.session_state.doc_tags.get(f, set()) & prefer_tags]
-        others    = [f for f in files if f not in preferred]
+        others = [f for f in files if f not in preferred]
         files = preferred + others
 
     # scorri i file finché una combinazione soddisfa la regola
@@ -1132,7 +1642,7 @@ def load_preset_questions(path: str = "domande_preimpostate.json") -> Dict[str, 
 
 
 # --------------------------------- UI --------------------------------------
-st.title("📄 Analisi automatica Istruttorie")
+st.title("📄 Analisi Ricevibilità - Ammissibilità")
 
 # Session state init
 if "texts" not in st.session_state:
@@ -1163,7 +1673,6 @@ if "tag_by_text" not in st.session_state:
     st.session_state.tag_by_text: Dict[str, Set[str]] = {}
 if "ab_extract_result" not in st.session_state:
     st.session_state.ab_extract_result = None
-
 
 # Sidebar – Upload e pipeline
 with st.sidebar:
@@ -1201,21 +1710,31 @@ with st.sidebar:
             st.success("✅ Testi estratti e indicizzati. Tag (solo boost) assegnati.")
 
     if st.session_state.texts:
-        st.markdown("### 🔎 Seleziona i documenti da includere nella RAG")
+        # 🔼 Sposto il bottone QUI, sopra alla selezione documenti
+        if st.button("▶️ Analizza ricevibilità", key="btn_sidebar_pec_top"):
+            with st.spinner("Analizzo la ricevibilità per ciascun documento…"):
+                st.session_state.pec_results = {
+                    fname: analyze_pec_document(text)
+                    for fname, text in st.session_state.texts.items()
+                }
+            st.session_state.show_pec_results = True
+            st.success("Analisi PEC completata. Scorri la pagina per vedere i risultati.")
+
+        # --- poi la selezione dei documenti per la RAG ---
+        st.markdown("### 🔎 Seleziona i documenti per l'addestramento")
         selected = []
         for idx, nome in enumerate(st.session_state.texts):
             sel = st.checkbox(f"{nome}", value=True, key=make_key("sel", idx, nome))
             if sel:
                 selected.append(nome)
 
-        # KEY STABILE
-        if st.button("📚 Addestra Sistema", key="btn_build_rag"):
+        # --- e infine il bottone di addestramento ---
+        if st.button("📚 Addestra Sistema - Ammissibilità", key="btn_build_rag"):
             sel_texts = {n: st.session_state.texts[n] for n in selected} if selected else st.session_state.texts
             retriever, _ = build_retriever(sel_texts)
             st.session_state.retriever = retriever
             st.session_state.llm = get_llm()
             st.success(f"📚 Addestramento terminato! Documenti indicizzati: {len(sel_texts)}")
-
 
 # Main – Lista file + tag
 with st.expander("📋 File caricati e tag assegnati", expanded=False):
@@ -1227,7 +1746,6 @@ with st.expander("📋 File caricati e tag assegnati", expanded=False):
         st.markdown(f"- {icona} `{nome}` — **Tag (boost):** {', '.join(all_tags) if all_tags else '—'}")
         if all_tags:
             st.caption(f"Da nome: {', '.join(t_fn) or '—'} · Da contenuto: {', '.join(t_tx) or '—'}")
-
 
 # Anteprima testi estratti
 with st.expander("📝 Anteprima testi estratti", expanded=False):
@@ -1241,7 +1759,6 @@ with st.expander("📝 Anteprima testi estratti", expanded=False):
                 disabled=True,
                 key=make_key("preview_text", idx, nome, len(testo)),
             )
-
 
 # ---------------------- Firme digitali (mostra solo dopo estrazione) ----------------------
 if st.session_state.texts:  # se ci sono testi estratti, vuol dire che hai già caricato/elaborato i file
@@ -1266,6 +1783,135 @@ if st.session_state.texts:  # se ci sono testi estratti, vuol dire che hai già 
     if not trovati:
         st.info("Nessuna firma digitale rilevata nei file caricati (.p7m).")
 
+        # ----- Risultati ricevibilità PEC (render se disponibili) -----
+
+        # ----- Risultati ricevibilità PEC (render se disponibili) -----
+    if st.session_state.get("pec_results"):
+        st.markdown("---")
+        st.header("📬 Analisi della ricevibilità (PEC) – risultati")
+        import pandas as pd
+
+        rows = []
+
+        for fname, res in st.session_state.pec_results.items():
+            st.subheader(f"📄 {fname}")
+
+
+            def _badge(v: dict) -> str:
+                ok = str(v.get("esito", "")).lower().startswith("sì")
+                return "✅ Sì" if ok else "❌ No"
+
+
+            # --- valori "puliti" come nel CSV ---
+            oggetto_val = res.get("oggetto_valore", "") or "—"
+            nei_term_data = res.get("nei_termini_data", "") or "—"
+            mittente_val = res.get("mittente_valore", "") or "—"
+            proto_num = res.get("protocollo_numero", "") or "—"
+            proto_dt = res.get("protocollo_data", "") or ""
+
+            # Righe riassuntive coerenti al CSV (niente prefissi nel valore)
+            st.markdown(
+                f"- **Domanda pervenuta tramite PEC (art. 8 c.2)**: {_badge(res['pec_ai_sensi_art8'])}"
+            )
+            st.markdown(
+                f"- **Oggetto conforme (art. 8 c.2)**: {_badge(res['oggetto_conforme'])} — _{oggetto_val}_"
+            )
+            st.markdown(
+                f"- **Presentata nei termini (DM 243212/2024)**: {_badge(res['nei_termini'])} — {nei_term_data}"
+            )
+            st.markdown(
+                f"- **Mittente PEC**: {_badge(res['mittente_pec'])} — {mittente_val}"
+            )
+            st.markdown(
+                f"- **Assunta al protocollo**: {_badge(res['protocollo'])} — {proto_num}"
+                + (f" — {proto_dt}" if proto_dt else "")
+            )
+
+
+            # Evidenze con anteprima pagina
+            def _render_ev(label: str, payload: dict):
+                ev = payload.get("evidenza") or []
+                if not ev:
+                    return
+                e = ev[0]
+                st.caption(f"📎 Evidenza {label}: p.{e.get('page', '?')} — “{e.get('quote', '')[:200]}”")
+                if st.button("👁️ Anteprima pagina", key=stable_key("pec_prev", fname, label, e.get('page', '?'))):
+                    show_pdf_page_image(fname, e.get('page', 1))
+
+
+            # Raccogli la prima evidenza utile tra le 4
+            # Evidenza unica + anteprima apri/chiudi (expander)
+            # Ordine di priorità: mittente -> oggetto -> termini -> protocollo -> ricevibilità
+            priority = ["mittente_pec", "oggetto_conforme", "nei_termini", "protocollo", "pec_ai_sensi_art8"]
+
+            first_ev = None
+            first_key = None
+            for k in priority:
+                evs = res.get(k, {}).get("evidenza") or []
+                if evs:
+                    first_ev = evs[0]
+                    first_key = k
+                    break
+
+            if first_ev:
+                page = first_ev.get("page", "?")
+                quote = first_ev.get("quote", "").strip().replace("\n", " ")
+                quote_short = (quote[:200] + "…") if len(quote) > 200 else quote
+
+                st.caption(f"📎 Evidenza ({first_key}): p.{page} — “{quote_short}”")
+                with st.expander(f"👁️ Anteprima documento — {fname}", expanded=False):
+                    show_pdf_page_image(fname, page)
+
+            st.divider()
+
+            rows.append({
+                "file": fname,
+                "PEC (art.8 c.2)": res["pec_ai_sensi_art8"]["esito"],
+
+                "Oggetto conforme": res["oggetto_conforme"]["esito"],
+                "Oggetto": res.get("oggetto_valore", ""),
+
+                "Nei termini": res["nei_termini"]["esito"],
+                "Data rilevata": res.get("nei_termini_data", ""),
+
+                "Protocollo": res["protocollo"]["esito"],
+                "Numero Protocollo": res.get("protocollo_numero", ""),
+                "Data Protocollo": res.get("protocollo_data", ""),
+
+                "Mittente PEC": res["mittente_pec"]["esito"],
+                "Mittente": res.get("mittente_valore", ""),
+            })
+
+        df = pd.DataFrame(rows)
+        st.markdown("### 📦 Esporta risultati")
+        st.dataframe(df, use_container_width=True)
+
+        # --- export: proteggi zeri iniziali in Excel ---
+        df_export = df.copy()
+
+
+        def _protect_excel_text(x: str) -> str:
+            x = (str(x) if x is not None else "").strip()
+            return f'="{x}"' if x else ""
+
+
+        if "Numero Protocollo" in df_export.columns:
+            df_export["Numero Protocollo"] = df_export["Numero Protocollo"].map(_protect_excel_text)
+
+        csv_str = df_export.to_csv(index=False, sep=";")
+        csv_bytes = ("\ufeff" + csv_str).encode("utf-8")  # BOM per Excel
+
+        json_bytes = json.dumps(st.session_state.pec_results, ensure_ascii=False, indent=2).encode("utf-8")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button("⬇️ Scarica CSV (;) risultati PEC",
+                               data=csv_bytes, file_name="pec_ricevibilita.csv",
+                               mime="text/csv", use_container_width=True)
+        with c2:
+            st.download_button("⬇️ Scarica JSON risultati PEC",
+                               data=json_bytes, file_name="pec_ricevibilita.json",
+                               mime="application/json", use_container_width=True)
 
 # ---------------------------- Q&A + Check-list ------------------------------
 if st.session_state.retriever and st.session_state.llm:
@@ -1274,6 +1920,7 @@ if st.session_state.retriever and st.session_state.llm:
     # Domanda libera (UN SOLO INPUT, con key stabile)
     st.header("❓ Domanda libera sui documenti")
     query = st.text_input("Scrivi la tua domanda", key="free_query_input")
+
 
     def infer_liked_from_text(t: str) -> Set[str]:
         liked = set()
@@ -1290,9 +1937,12 @@ if st.session_state.retriever and st.session_state.llm:
             liked.add("Allegato_C3")
         if "allegato c" in tl and not {"Allegato_C1", "Allegato_C2", "Allegato_C3"} & liked:
             liked.add("Allegato_C")
+        if "allegato d" in tl:
+            liked.add("Allegato_D")
         if "allegato e" in tl:
             liked.add("Allegato_E")
         return liked
+
 
     if st.button("🔍 Rispondi", key="btn_free_answer") and query.strip():
         with st.spinner("Sto cercando nei documenti…"):
@@ -1380,32 +2030,59 @@ if st.session_state.retriever and st.session_state.llm:
             st.session_state.att_results = {}
             st.session_state.att_ran_once = False
 
-    # Griglia card
+    # Griglia card con anteprima pagina/evidenza (apri/chiudi)
     st.markdown('<div class="allegati-grid">', unsafe_allow_html=True)
+
     for label in ATT_RULES.keys():
         res = st.session_state.att_results.get(label)
 
+        ev = (res or {}).get("ev") or []
+        ev0 = ev[0] if ev else None
+        ev_src = ev0.get("source") if ev0 else None
+        ev_page = ev0.get("page") if ev0 else None
+        ev_quote = (ev0.get("quote", "") if ev0 else "").strip()
+
         if not res:
-            badge = '<span class="badge badge-na">Non verificato</span>'
+            badge_html = '<span class="badge badge-na">Non verificato</span>'
             icon = "❔"
             answer = "_Premi verifica per controllare_"
         else:
             ok = str(res["ans"]).lower().startswith("sì")
-            badge = '<span class="badge badge-ok">Presente</span>' if ok else '<span class="badge badge-ko">Assente</span>'
+            badge_html = (
+                '<span class="badge badge-ok">Presente</span>' if ok
+                else '<span class="badge badge-ko">Assente</span>'
+            )
             icon = "✅" if ok else "❌"
             answer = res["ans"]
 
-        # Card HTML (uguale per tutti)
+        # Card HTML (titolo + esito)
         st.markdown(
             f"""
             <div class="allegato-card">
               <div class="allegato-title">{icon} {label}</div>
-              <div>{badge}</div>
+              <div>{badge_html}</div>
               <div class="answer-text">{answer}</div>
-            </div>
             """,
             unsafe_allow_html=True
         )
+
+        # Se c'è un'evidenza, mostra quote + toggle anteprima
+        if ev0:
+            quote_short = (ev_quote[:200] + "…") if len(ev_quote) > 200 else ev_quote
+            st.caption(f"📎 Evidenza: _{ev_src} – p.{ev_page}_")
+            if quote_short:
+                st.markdown(f"> {quote_short}")
+
+            # Toggle persistente: apre/chiude l’anteprima pagina
+            toggle_key = stable_key("att_prev_open", label, ev_src, ev_page)
+            open_preview = st.checkbox("👁️ Anteprima pagina", key=toggle_key)
+
+            if open_preview:
+                show_pdf_page_image(ev_src, ev_page)
+
+        # chiudi card
+        st.markdown("</div>", unsafe_allow_html=True)
+
     st.markdown('</div>', unsafe_allow_html=True)
 
     # ─────────────────────────────────────────────────────────────────────────────
@@ -1429,7 +2106,7 @@ if st.session_state.retriever and st.session_state.llm:
         candidates = from_ev + tagged + by_text
         candidates = [c for c in candidates if c in st.session_state.texts]  # safety
 
-        st.markdown("#### ➡️ Estrai dati **Allegato B** (inline)")
+        st.markdown("#### ➡️ Estrai dati **Allegato B**")
         if not candidates:
             st.info("Nessun documento candidato trovato nonostante il match regex. Controlla i tag o il contenuto.")
         else:
@@ -1483,6 +2160,7 @@ if st.session_state.retriever and st.session_state.llm:
     st.header("✅ Check-list verifiche (RAG)")
 
     PRESET_QUESTIONS = load_preset_questions()
+
 
     # util per chiavi stabili per-riga
     def stable_id(prefix: str, label: str) -> str:
