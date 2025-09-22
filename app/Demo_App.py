@@ -637,82 +637,6 @@ def analyze_pec_document(text_ff: str) -> Dict:
         "nei_termini_data": dt.strftime("%d/%m/%Y %H:%M:%S") if dt else "",
     }
 
-    def _norm_subject(s: str) -> str:
-        s = re.sub(r"^\s*posta\s+certificata\s*:\s*", "", s, flags=re.I)
-        s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
-        return re.sub(r"\s+", " ", s).strip().lower()
-
-    # prendi riga dopo "Oggetto:" anche se spezzata
-    m_subj = re.search(r"(?:^|\n)\s*(?:oggetto|subject)\s*:\s*(.+)", txt, flags=re.I)
-    subj_raw = m_subj.group(1).strip() if m_subj else ""
-    subj_norm = _norm_subject(subj_raw) if subj_raw else ""
-    exp_norm = _norm_subject(EXPECTED_SUBJECT)
-    ok_subject = bool(subj_norm) and (exp_norm in subj_norm or subj_norm in exp_norm)
-    ev2_q = subj_raw[:240] if subj_raw else None
-    ev2_p = _page_of_match(text_ff, m_subj.start()) if m_subj else None
-
-    # --------------------- 3) Termini ---------------------------
-    dt = _first_dt_in_text(txt)
-    ok_window = bool(dt and (WINDOW_START <= dt <= WINDOW_END))
-    ev3_q = None
-    ev3_p = None
-    if dt:
-        # mostriamo lo stesso match usato per trovare la data
-        for rx in _RX_DATES:
-            mm = rx.search(txt)
-            if mm:
-                ev3_q = re.sub(r"\s+", " ", mm.group(0))[:240]
-                ev3_p = _page_of_match(text_ff, mm.start())
-                break
-
-    # --------------------- 3.bis) Mittente PEC ---------------------------
-    sender, evs_q, evs_p = _find_sender(txt)
-    ok_sender = bool(sender)
-
-    # ... (sezione 4: Protocollo) ...
-
-    # --------------------- 4) Protocollo ------------------------
-    # Normalizza SOLO per il parsing del protocollo: rimuove spazi tra cifre e attorno agli slash
-    txt_compact = re.sub(r"\s*/\s*", "/", txt)
-    txt_compact = re.sub(r"(?<=\d)\s+(?=\d)", "", txt_compact)
-
-    # Regex principale: Protocollo [di] Ingresso N. <numero> (opzionale "del <data>")
-    rx_proto_full = re.compile(
-        r"(?:protocollo|prot\.?)\s*(?:di\s*ingresso|ingresso)?\s*(?:n\.?|num\.?)\s*"
-        r"(?P<num>[A-Z0-9\/\.\-]{3,})"
-        r"(?:\s*(?:del|in\s*data)\s*(?P<data>[0-3]?\d[\/\.-][01]?\d[\/\.-]\d{4}))?",
-        re.I | re.S
-    )
-
-    m_full = rx_proto_full.search(txt_compact)
-    proto_num = (m_full.group("num").strip() if m_full and m_full.group("num") else "")
-    proto_date = (m_full.group("data").strip() if m_full and m_full.group("data") else "")
-
-    ok_proto = bool(proto_num)
-
-    # Evidenza: prova a trovare nel testo originale una riga con Prot... e (se possibile) la data
-    rx_proto_line = re.compile(
-        r"(?:protocollo|prot\.?).{0,80}(?:ingresso)?.{0,80}(?:n\.?|num\.?).{0,80}"
-        r"(?:del|in\s*data)?.{0,20}\d{1,2}\s*[\/\.-]\s*\d{1,2}\s*[\/\.-]\s*\d{4}",
-        re.I | re.S
-    )
-    mp_line = rx_proto_line.search(txt)
-    if not mp_line:
-        # fallback: almeno la parte con "Prot ... N."
-        rx_proto_any = re.compile(r"(?:protocollo|prot\.?).{0,80}(?:n\.?|num\.?).{0,40}[A-Z0-9\/\.\-]{3,}", re.I | re.S)
-        mp_line = rx_proto_any.search(txt)
-
-    ev4_q = (re.sub(r"\s+", " ", mp_line.group(0)).strip()[:240]) if mp_line else (proto_num or None)
-    ev4_p = _page_of_match(text_ff, mp_line.start()) if mp_line else None
-
-    proto_detail = ""
-    if ok_proto and proto_date:
-        proto_detail = f"Protocollo: {proto_num} — Data: {proto_date}"
-    elif ok_proto:
-        proto_detail = f"Protocollo: {proto_num}"
-    else:
-        proto_detail = "Numero di protocollo non trovato."
-
 
 # --------------------- RAG: embeddings, retriever, ask ---------------------
 @st.cache_resource(show_spinner=False)
@@ -734,7 +658,7 @@ def get_llm():
         location=VERTEX_LOCATION,
         credentials=GOOGLE_CREDENTIALS,
         temperature=0.2,
-        max_output_tokens=2048,
+        max_output_tokens=8192,
     )
 
 
@@ -777,7 +701,7 @@ def build_retriever(text_by_file: Dict[str, str]):
     vectordb = FAISS.from_documents(chunks, get_embeddings())
     sem_ret = vectordb.as_retriever(
         search_type="mmr",
-        search_kwargs={"k": 40, "fetch_k": 220, "lambda_mult": 0.55}
+        search_kwargs={"k": 50, "fetch_k": 300, "lambda_mult": 0.5}
     )
     bm25 = BM25Retriever.from_documents(chunks)
     bm25.k = 40
@@ -1304,6 +1228,225 @@ def ask_rag(
 
     return final_answer, validated
 
+def ask_rag_detailed(
+    question: str,
+    retriever,
+    llm,
+    liked_tags: Optional[Set[str]] = None,
+    max_docs: int = 20,
+    max_evidences: int = 5
+) -> str:
+    docs = retriever.invoke(question)
+    docs = rerank_by_cosine_with_boost(
+        question, docs,
+        liked_tags=liked_tags,
+        tags_by_source=st.session_state.doc_tags,
+        top_n=max_docs
+    )
+
+    # CONTEXT in blocchi <doc>
+    context_blocks = []
+    for d in docs:
+        src = d.metadata.get("source", "?")
+        pg  = d.metadata.get("page", "?")
+        txt = d.page_content.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        context_blocks.append(f'<doc source="{src}" page="{pg}">\n{txt}\n</doc>')
+    context = "\n".join(context_blocks)
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system",
+             "Sei un assistente legale. Rispondi SOLO usando il CONTEXT fornito (testo dentro i tag <doc …> … </doc>). "
+             "Non aggiungere conoscenze esterne né interpretazioni creative.\n\n"
+             "FORMATTAZIONE OBBLIGATORIA (in questo esatto ordine):\n"
+             "## Analisi per punti\n"
+             "- Produci da 3 a 10 bullet sintetici e operativi. Ogni bullet deve riflettere informazioni ESPLICITE nel CONTEXT. "
+             "Se qualcosa non è presente nel CONTEXT, aggiungi un bullet tipo: 'Informazione mancante: …'.\n\n"
+             "## Valutazione a/b/c\n"
+             "- Per ciascuna lettera scrivi SOLO 'Sì', 'No' oppure 'Incertezza', seguito da una riga di motivazione. "
+             "Se la domanda non definisce i tre aspetti, scegli tu tre criteri pertinenti e indicali tra parentesi (es. '(Presenza)') "
+             "prima del giudizio. Niente paragrafi lunghi.\n\n"
+             "## Evidenze\n"
+             "- Inserisci fino a {{max_evidences}} citazioni VERBATIM, ognuna come blocco quote Markdown (riga che inizia con '>'), "
+             "lunghezza massima 240 caratteri; subito sotto specifica in corsivo il riferimento *(file – p.X)*.\n"
+             "- La prima citazione deve essere la più decisiva e, nelle domande di attribuzione/responsabilità (chi paga/sostiene/è responsabile/intestatario), "
+             "deve contenere nella stessa frase o in adiacenza immediata sia l’azione sia il soggetto.\n"
+             "- Se non trovi citazioni adeguate, scrivi: 'Nessuna evidenza adeguata trovata nel CONTEXT.' e non concludere 'Sì'.\n\n"
+             "REGOLE:\n"
+             "1) Usa solo frasi presenti nel CONTEXT per trarre conclusioni. Se i testi sono ambigui o contraddittori, indica la contraddizione e scegli 'Incertezza'.\n"
+             "2) Le citazioni sono VERBATIM (nessuna parafrasi). Fuori dalle citazioni, resta sintetico. "
+             "3) Non riportare intere pagine; resta nei limiti. 4) Rispondi in italiano."
+             ),
+            ("human",
+             "DOMANDA:\n{{ question }}\n\nCONTEXT:\n{{ context }}\n\n"
+             "Applica rigorosamente il formato e le regole sopra.")
+        ],
+        template_format="jinja2",
+    )
+
+    msgs = prompt.format_messages(
+        question=question,
+        context=context,
+        max_evidences=max_evidences
+    )
+    return llm.invoke(msgs).content  # Markdown completo
+
+def _make_context_blocks_for_bullets(docs: List[Document]) -> str:
+    blocks = []
+    for d in docs:
+        src = d.metadata.get("source", "?")
+        pg  = d.metadata.get("page", "?")
+        txt = d.page_content.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        blocks.append(f'<doc source="{src}" page="{pg}">\n{txt}\n</doc>')
+    return "\n".join(blocks)
+
+def _validate_bullet_evidence(ev_list: List[Dict], docs: List[Document], max_items: int = 3) -> List[Dict]:
+    """Tiene solo le evidenze che compaiono davvero nel testo del chunk indicato (max 3)."""
+    out = []
+
+    def page_text(src, pg):
+        for d in docs:
+            if d.metadata.get("source")==src and str(d.metadata.get("page"))==str(pg):
+                return d.page_content
+        return ""
+
+    for ev in (ev_list or [])[:max_items]:
+        try:
+            src = str(ev.get("source","?")).strip()
+            pg  = ev.get("page","?")
+            try: pg = int(pg)
+            except: pg = str(pg)
+            q   = _strip_header_from_quote(str(ev.get("quote",""))[:240], src)
+            txt = page_text(src, pg)
+            if q and txt and (_norm_quote_for_compare(q) in _norm_quote_for_compare(txt)):
+                out.append({"source":src,"page":pg,"quote":q})
+        except Exception:
+            continue
+    return out
+
+def _pick_docs_for_bullets(question: str, retriever, liked_tags=None, top_n: int = 18) -> List[Document]:
+    docs = retriever.invoke(question)
+    return rerank_by_cosine_with_boost(
+        question, docs, liked_tags=liked_tags,
+        tags_by_source=st.session_state.doc_tags, top_n=top_n
+    )
+
+def ask_rag_bullets(
+    question: str,
+    retriever,
+    llm,
+    liked_tags: Optional[Set[str]] = None,
+    max_docs: int = 18,
+    min_bullets: int = 3,
+    max_bullets: int = 6
+) -> Dict:
+    """
+    Ritorna un payload:
+    {
+      "verdict": "Sì|No|Incertezza",
+      "bullets": ["...", "..."],
+      "evidence": [{"source":"file.pdf","page":N,"quote":"..."}]
+    }
+    """
+    docs = _pick_docs_for_bullets(question, retriever, liked_tags=liked_tags, top_n=max_docs)
+    if not docs:
+        return {"verdict":"Incertezza","bullets":["Nessun documento pertinente recuperato."],"evidence":[]}
+
+    context = _make_context_blocks_for_bullets(docs)
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system",
+             "Sei un assistente legale. Usa SOLO il CONTEXT per rispondere alla DOMANDA.\n"
+             "Restituisci SEMPRE e SOLO un JSON con le chiavi esatte:\n"
+             '{ "verdict":"Sì|No|Incertezza", "bullets":[...], '
+             '"evidence":[{"source":"<file>","page":<n>,"quote":"<≤240 caratteri, VERBATIM>"}] }\n'
+             "Regole di decisione (universali):\n"
+             f"- bullets: da {min_bullets} a {max_bullets} punti, frasi brevi e operative, "
+             "ancorate a ciò che c’è (o manca) nel CONTEXT.\n"
+             "- evidence: 1–3 citazioni VERBATIM dal CONTEXT; la PRIMA deve essere la più decisiva.\n"
+             "- 'Sì' SOLO se almeno una citazione prova direttamente il nucleo della domanda.\n"
+             "  • Per domande di ATTRIBUZIONE (chi paga/chi è responsabile/intestatario…): "
+             "la citazione deve contenere nella stessa frase (o adiacenza immediata) il predicato "
+             "('a carico di', 'sostenute da', 'responsabile', 'intestatario'…) e l’attore "
+             "(beneficiari/proponente/ente X). In mancanza → non rispondere 'Sì'.\n"
+             "  • Per NUMERI/DATE/SOGLIE: la citazione deve riportare il valore esplicito.\n"
+             "  • Per PRESENZA/CONFORMITÀ: serve una dicitura testuale esplicita (titolo/intestazione/regola).\n"
+             "- 'No' quando il CONTEXT contiene una frase che contraddice la condizione richiesta (citala).\n"
+             "- Se i testi sono insufficienti/ambigui/contraddittori → 'Incertezza'.\n"
+             "- Se non trovi citazioni adeguate, non usare 'Sì' e imposta 'evidence': [].\n"
+             "- Citazioni senza parafrasi, ≤240 caratteri. Nessun testo fuori dal JSON. Rispondi in italiano."
+             ),
+            ("human",
+             "DOMANDA:\n{{ question }}\n\nCONTEXT:\n{{ context }}\n\n"
+             "Rispondi SOLO con il JSON richiesto.")
+        ],
+        template_format="jinja2",
+    )
+
+    msgs = prompt.format_messages(question=question, context=context)
+    raw = llm.invoke(msgs).content
+
+    # parsing robusto
+    data = None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        m = re.search(r'\{.*\}', raw, flags=re.S)
+        if m:
+            try: data = json.loads(m.group(0))
+            except Exception: data = None
+
+    if not isinstance(data, dict):
+        data = {"verdict":"Incertezza","bullets":["Risposta non in JSON valido."],"evidence":[]}
+
+    # normalizza campi
+    data.setdefault("verdict", "Incertezza")
+    data.setdefault("bullets", [])
+    data.setdefault("evidence", [])
+
+    # valida evidenze
+    data["evidence"] = _validate_bullet_evidence(data.get("evidence"), docs, max_items=3)
+
+    # se "Sì" ma senza evidenze valide, degrada a Incertezza
+    if str(data["verdict"]).strip().lower().startswith("sì") and not data["evidence"]:
+        data["verdict"] = "Incertezza"
+        if len(data["bullets"]) < max_bullets:
+            data["bullets"].append("Evidenze non verificabili nei testi: servono riferimenti precisi.")
+
+    # limita bullets
+    if not isinstance(data["bullets"], list):
+        data["bullets"] = [str(data["bullets"])]
+    data["bullets"] = [b for b in data["bullets"] if b][:max_bullets]
+    while len(data["bullets"]) < min_bullets:
+        data["bullets"].append("Informazione parziale o non conclusiva nel CONTEXT.")
+
+    return data
+
+def render_bullets_result(payload: Dict, section_key: str):
+    verdict = payload.get("verdict","Incertezza")
+    bullets = payload.get("bullets", [])
+    evs     = payload.get("evidence", [])
+
+    icon = "✅" if verdict=="Sì" else ("❌" if verdict=="No" else "⚠️")
+    st.markdown(f"**Esito:** {icon} {verdict}")
+
+    if bullets:
+        st.markdown("**Perché:**")
+        for b in bullets:
+            st.markdown(f"- {b}")
+
+    if evs:
+        st.markdown("**Evidenze:**")
+        for i, e in enumerate(evs, start=1):
+            st.markdown(f"- _{e['source']} – p.{e['page']}_")
+            st.markdown(f"> {e['quote']}")
+            toggle_key = stable_key('blt_prev_open', section_key, i, e['source'], e['page'])
+            open_preview = st.checkbox("👁️ Mostra/chiudi anteprima", key=toggle_key)
+            if open_preview:
+                show_pdf_page_image(e["source"], e["page"])
+
+
 
 # --------------------- Pipeline file (estrazione e tag) ---------------------
 def process_uploaded_file(file) -> Optional[str]:
@@ -1403,7 +1546,10 @@ def render_evidence_block(evidence: List[Dict], section_id: str, title: str = "�
     src, pg, quote = e["source"], e["page"], e["quote"]
     st.markdown(f"**{title}**  \n_{src} – p.{pg}_")
     st.markdown(f"> {quote}")
-    if st.button("👁️ Anteprima pagina", key=stable_key("prev", section_id, src, pg)):
+
+    toggle_key = stable_key("prev_open_free", section_id, src, pg)
+    open_preview = st.checkbox("👁️ Mostra/chiudi anteprima", key=toggle_key)
+    if open_preview:
         show_pdf_page_image(src, pg)
 
 
@@ -1638,6 +1784,15 @@ def load_preset_questions(path: str = "domande_preimpostate.json") -> Dict[str, 
             return {k: v for k, v in data.items() if k not in SKIP}
     except Exception as e:
         st.error(f"Errore nel caricamento delle domande preimpostate: {e}")
+        return {}
+
+@st.cache_resource(show_spinner=False)
+def load_questions(path: str) -> Dict[str, str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        st.error(f"Errore nel caricamento domande '{path}': {e}")
         return {}
 
 
@@ -2157,9 +2312,19 @@ if st.session_state.retriever and st.session_state.llm:
 
     # ----------------- Check-list RAG (tutto il resto) ----------------------
     st.markdown("---")
-    st.header("✅ Check-list verifiche (RAG)")
+    st.header("✅ Analisi ammissibilità")
 
-    PRESET_QUESTIONS = load_preset_questions()
+    mode = st.radio(
+        "Scegli tipo di analisi",
+        ["Primo blocco (brevi)", "Secondo blocco (complesse)"],
+        horizontal=True,
+        key="amm_mode"
+    )
+
+    if mode == "Domande brevi":
+        QUESTIONS = load_questions("domande_preimpostate_Semplici.json")
+    else:
+        QUESTIONS = load_questions("domande_preimpostate_Complesse.json")
 
 
     # util per chiavi stabili per-riga
@@ -2168,61 +2333,42 @@ if st.session_state.retriever and st.session_state.llm:
 
 
     # Bar comandi
-    c1, c2, c3 = st.columns([0.5, 0.25, 0.25])
-    with c2:
-        if st.button("🏃‍♂️ Esegui tutte le verifiche", key="rag_run_all"):
-            for label, prompt in PRESET_QUESTIONS.items():
+    c1, c2 = st.columns([0.6, 0.4])
+    with c1:
+        if st.button("🏃‍♂️ Esegui tutte le verifiche", key="run_all_mode"):
+            for label, prompt in QUESTIONS.items():
                 liked = infer_liked_from_text(label + " " + prompt)
-                with st.spinner(f"Verifico (RAG): {label}…"):
-                    ans, srcs = ask_rag(
-                        prompt,
-                        st.session_state.retriever,
-                        st.session_state.llm,
-                        liked_tags=liked or None
-                    )
-                st.session_state.check_results[label] = ans
-                st.session_state.check_sources[label] = srcs or []
+                with st.spinner(f"Analisi: {label}…"):
+                    payload = ask_rag_bullets(prompt, st.session_state.retriever, st.session_state.llm,
+                                              liked_tags=liked or None, max_docs=20)
+                    st.session_state.check_results[label] = payload
+                    st.session_state.check_sources[label] = []  # non usato qui
             st.success("Verifiche completate.")
-    with c3:
-        if st.button("♻️ Reset risultati", key="rag_reset"):
+    with c2:
+        if st.button("♻️ Reset", key="reset_mode"):
             st.session_state.check_results = {}
             st.session_state.check_sources = {}
             st.rerun()
 
-    # Tabella/righe
-    for label, prompt in PRESET_QUESTIONS.items():
+    for label, prompt in QUESTIONS.items():
         res = st.session_state.check_results.get(label)
-        icon = "⬜️"
-        if isinstance(res, str):
-            icon = "✅" if res.lower().startswith("sì") else "❌"
-
-        r1, r2, r3, r4 = st.columns([0.07, 0.48, 0.25, 0.20])
-        with r1:
-            st.markdown(icon)
-        with r2:
+        col1, col2, col3 = st.columns([0.45, 0.40, 0.15])
+        with col1:
             st.markdown(f"**{label}**")
-        with r3:
-            st.markdown(res if res else "_Non verificata_")
-        with r4:
-            # Esegui sempre disponibile
-            if st.button("Esegui", key=stable_id("rag_re", label)):
+            st.caption(prompt)
+        with col3:
+            if st.button("Esegui", key=f"run_{hash(label) % 10 ** 8}"):
                 liked = infer_liked_from_text(label + " " + prompt)
-                with st.spinner(f"Eseguo (RAG): {label}…"):
-                    ans, srcs = ask_rag(
-                        prompt,
-                        st.session_state.retriever,
-                        st.session_state.llm,
-                        liked_tags=liked or None
-                    )
-                st.session_state.check_results[label] = ans
-                st.session_state.check_sources[label] = srcs or []
+                with st.spinner(f"Analisi: {label}…"):
+                    payload = ask_rag_bullets(prompt, st.session_state.retriever, st.session_state.llm,
+                                              liked_tags=liked or None, max_docs=20)
+                    st.session_state.check_results[label] = payload
+                    st.session_state.check_sources[label] = []
                 st.rerun()
 
-        # Evidenza (se presente)
-        if st.session_state.check_sources.get(label):
-            with st.expander("📎 Evidenza"):
-                render_evidence_block(
-                    st.session_state.check_sources.get(label, []),
-                    section_id=f"check:{label}"
-                )
+        with col2:
+            res = st.session_state.check_results.get(label)
+            if res:
+                with st.expander("📄 Risposta dettagliata", expanded=True):
+                    render_bullets_result(res, section_key=label)
         st.divider()
