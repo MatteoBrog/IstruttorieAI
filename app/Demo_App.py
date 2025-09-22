@@ -2321,7 +2321,8 @@ if st.session_state.retriever and st.session_state.llm:
         key="amm_mode"
     )
 
-    if mode == "Domande brevi":
+    # Confronto robusto sul testo scelto
+    if "brevi" in mode.lower():
         QUESTIONS = load_questions("domande_preimpostate_Semplici.json")
     else:
         QUESTIONS = load_questions("domande_preimpostate_Complesse.json")
