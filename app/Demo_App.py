@@ -1423,6 +1423,13 @@ def ask_rag_bullets(
 
     return data
 
+def render_simple_result(answer: str, evidence: List[Dict], section_key: str):
+    st.markdown("**Esito:**")
+    st.success(answer)
+    if evidence:
+        render_evidence_block(evidence, section_id=section_key, title="📎 Evidenza")
+
+
 def render_bullets_result(payload: Dict, section_key: str):
     verdict = payload.get("verdict","Incertezza")
     bullets = payload.get("bullets", [])
@@ -2320,6 +2327,7 @@ if st.session_state.retriever and st.session_state.llm:
         horizontal=True,
         key="amm_mode"
     )
+    is_simple = "brevi" in mode.lower()
 
     # Confronto robusto sul testo scelto
     if "brevi" in mode.lower():
@@ -2340,10 +2348,30 @@ if st.session_state.retriever and st.session_state.llm:
             for label, prompt in QUESTIONS.items():
                 liked = infer_liked_from_text(label + " " + prompt)
                 with st.spinner(f"Analisi: {label}…"):
-                    payload = ask_rag_bullets(prompt, st.session_state.retriever, st.session_state.llm,
-                                              liked_tags=liked or None, max_docs=20)
-                    st.session_state.check_results[label] = payload
-                    st.session_state.check_sources[label] = []  # non usato qui
+                    if is_simple:
+                        # ⬅️ LOGICA ORIGINALE PER DOMANDE BREVI
+                        answer, evidence = ask_rag(
+                            prompt,
+                            st.session_state.retriever,
+                            st.session_state.llm,
+                            liked_tags=liked or None
+                        )
+                        st.session_state.check_results[label] = {
+                            "type": "simple",
+                            "final_answer": answer,
+                            "evidence": evidence
+                        }
+                    else:
+                        # ⬅️ LOGICA A BULLET PER DOMANDE COMPLESSE
+                        payload = ask_rag_bullets(
+                            prompt,
+                            st.session_state.retriever,
+                            st.session_state.llm,
+                            liked_tags=liked or None,
+                            max_docs=20
+                        )
+                        st.session_state.check_results[label] = payload
+                        st.session_state.check_sources[label] = []  # non usato qui
             st.success("Verifiche completate.")
     with c2:
         if st.button("♻️ Reset", key="reset_mode"):
@@ -2358,18 +2386,44 @@ if st.session_state.retriever and st.session_state.llm:
             st.markdown(f"**{label}**")
             st.caption(prompt)
         with col3:
-            if st.button("Esegui", key=f"run_{hash(label) % 10 ** 8}"):
+            if st.button("Esegui", key=stable_id("run", f"{label}|{prompt}")):
                 liked = infer_liked_from_text(label + " " + prompt)
                 with st.spinner(f"Analisi: {label}…"):
-                    payload = ask_rag_bullets(prompt, st.session_state.retriever, st.session_state.llm,
-                                              liked_tags=liked or None, max_docs=20)
-                    st.session_state.check_results[label] = payload
-                    st.session_state.check_sources[label] = []
+                    if is_simple:
+                        # ⬅️ SEMPLICI → ask_rag
+                        answer, evidence = ask_rag(
+                            prompt,
+                            st.session_state.retriever,
+                            st.session_state.llm,
+                            liked_tags=liked or None
+                        )
+                        st.session_state.check_results[label] = {
+                            "type": "simple",
+                            "final_answer": answer,
+                            "evidence": evidence
+                        }
+                        st.session_state.check_sources[label] = []
+                    else:
+                        # ⬅️ COMPLESSE → ask_rag_bullets
+                        payload = ask_rag_bullets(
+                            prompt,
+                            st.session_state.retriever,
+                            st.session_state.llm,
+                            liked_tags=liked or None,
+                            max_docs=20
+                        )
+                        st.session_state.check_results[label] = payload
+                        st.session_state.check_sources[label] = []
                 st.rerun()
 
         with col2:
             res = st.session_state.check_results.get(label)
             if res:
-                with st.expander("📄 Risposta dettagliata", expanded=True):
-                    render_bullets_result(res, section_key=label)
-        st.divider()
+                if isinstance(res, dict) and res.get("type") == "simple":
+                    # ⬅️ RENDER BREVE
+                    with st.expander("📄 Risposta (breve)", expanded=True):
+                        render_simple_result(res["final_answer"], res.get("evidence", []), section_key=label)
+                else:
+                    # ⬅️ RENDER A BULLET (complesso)
+                    with st.expander("📄 Risposta dettagliata", expanded=True):
+                        render_bullets_result(res, section_key=label)
